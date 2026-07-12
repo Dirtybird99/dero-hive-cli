@@ -1,0 +1,178 @@
+# DERO Hive CLI
+
+DERO Hive CLI is a terminal-native AI coding workspace with multiple model providers, approval controls, project-aware tools, DERO development skills, and Model Context Protocol (MCP) support.
+
+## System requirements
+
+- Windows 10+, macOS 13+, or a current Linux distribution
+- Node.js 22 or later
+- npm 10 or later
+- Git for repository and worktree features
+- An internet connection for remote AI providers and initial installation
+
+## Install
+
+Install directly from GitHub:
+
+```bash
+npm install -g https://github.com/Dirtybird99/dero-hive-cli/archive/refs/heads/main.tar.gz --allow-remote=all --allow-scripts=better-sqlite3
+```
+
+`--allow-remote=all` permits this command to fetch the specified GitHub archive. The narrow `--allow-scripts` list permits only SQLite's native binding build. Hive and its DERO MCP server ship as prebuilt JavaScript bundles and run no install scripts. Do not use `sudo npm install -g`. If npm reports a permissions error, configure a user-owned global npm directory instead.
+
+### Verify the installation
+
+```bash
+hive --version
+hive status
+```
+
+If `hive` is not found, restart the terminal and confirm npm's global binary directory is on `PATH`:
+
+```bash
+npm prefix -g
+```
+
+## First run
+
+Open a terminal in the project you want Hive to work on, then launch it:
+
+```bash
+cd path/to/project
+hive
+```
+
+The launch directory becomes the tool workspace. Use `hive -C path/to/project` to select another directory.
+
+Add a model provider interactively:
+
+```bash
+hive provider add
+```
+
+Choose Codex to use its ChatGPT browser sign-in, or choose an API provider and enter its key at the prompt. Refresh a provider's model list when needed:
+
+```bash
+hive provider list
+hive provider refresh PROVIDER_ID
+```
+
+Run `hive --help` for non-interactive commands. Inside the full-screen interface, type `/` for commands, `?` for help, or `/shortcuts` for keyboard controls.
+
+## DERO MCP server
+
+Hive includes [DHEBP's DERO MCP server](https://github.com/DHEBP/dero-mcp-server) as an opt-in integration. It exposes 32 read-only tools, 4 resources, and 5 prompts.
+
+1. Start `hive`.
+2. Run `/mcp`.
+3. Select **DERO MCP server** and press Enter.
+
+The server checks `127.0.0.1:10102` first. If no local DERO daemon is available, it uses the upstream public fallback. Run your own daemon when query privacy matters. The MCP server does not require a wallet seed or private key.
+
+## Update
+
+Reinstall from the GitHub repository to get the current version:
+
+```bash
+npm install -g https://github.com/Dirtybird99/dero-hive-cli/archive/refs/heads/main.tar.gz --allow-remote=all --allow-scripts=better-sqlite3
+```
+
+DERO Hive CLI does not update itself in the background.
+
+## Uninstall
+
+Remove the global command:
+
+```bash
+npm uninstall -g dero-hive-cli
+```
+
+Configuration, provider credentials, conversations, and cached data remain under `~/.hive`. Delete that directory only if you also want to remove all local Hive data.
+
+macOS, Linux, or WSL:
+
+```bash
+rm -rf ~/.hive
+```
+
+Windows PowerShell:
+
+```powershell
+Remove-Item -Path "$HOME\.hive" -Recurse -Force
+```
+
+## Troubleshooting
+
+### Wrong Node.js version
+
+```bash
+node --version
+```
+
+Install Node.js 22 or later, then reinstall DERO Hive CLI.
+
+### Native module error
+
+`better-sqlite3` normally installs a prebuilt binary. If it does not load, reinstall with the approved scripts and a supported Node.js release:
+
+```bash
+npm install -g https://github.com/Dirtybird99/dero-hive-cli/archive/refs/heads/main.tar.gz --allow-remote=all --allow-scripts=better-sqlite3
+```
+
+### DERO MCP server unavailable
+
+Reinstall the package to restore its bundled server. To inspect configured servers afterward:
+
+```bash
+hive mcp list
+```
+
+### Use a separate data directory
+
+```bash
+hive --data-dir path/to/data
+```
+
+You can also set `HIVE_DATA_DIR`. Do not run two Hive processes against the same database.
+
+## Optional DERO simulator
+
+The simulator build requires Git, Go, and platform archive tools. From a source checkout:
+
+```bash
+npm run setup:simulator
+hive simulator status
+```
+
+The simulator is optional and is not downloaded during normal installation.
+
+## Development
+
+```bash
+git clone https://github.com/Dirtybird99/dero-hive-cli.git
+cd dero-hive-cli
+npm ci
+npm run dev
+```
+
+Checks:
+
+```bash
+npm run typecheck
+npm run lint
+npm test
+npm run build
+```
+
+## Data and security
+
+- Hive stores its local database, settings, logs, and secrets under `~/.hive` unless overridden.
+- Headless secret storage is machine-derived obfuscation, not an operating-system keychain. Protect the data directory accordingly.
+- Do not place API keys, wallet seeds, private keys, or personal configuration in a project repository.
+- Tool and MCP actions remain subject to Hive's approval controls.
+
+## License and credits
+
+DERO Hive CLI is available under the [MIT License](LICENSE).
+
+The bundled DERO MCP server retains its [DHEBP MIT license](resources/mcp/dero-mcp-server/LICENSE). Bundled DERO skills preserve their source attribution in [resources/skills/CREDITS.md](resources/skills/CREDITS.md).

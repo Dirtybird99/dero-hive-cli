@@ -1,0 +1,58 @@
+{
+  "name": "dero-mcp-server",
+  "mcpName": "io.github.DHEBP/dero-mcp-server",
+  "version": "0.4.8",
+  "description": "Model Context Protocol (MCP) server exposing DERO Stargate daemon JSON-RPC and bundled documentation to MCP clients. Vendored copy: builds automatically via scripts/setup-mcp.mjs on `npm install` in DERO Hive.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "data",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@noble/curves": "^2.2.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
+  },
+  "keywords": [
+    "dero",
+    "dero-blockchain",
+    "mcp",
+    "model-context-protocol",
+    "blockchain",
+    "json-rpc",
+    "privacy-blockchain",
+    "privacy-coin",
+    "stargate",
+    "dvm-basic",
+    "tela"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DHEBP/dero-mcp-server.git"
+  },
+  "homepage": "https://derod.org",
+  "vendoredFrom": {
+    "url": "https://github.com/DHEBP/dero-mcp-server",
+    "version": "0.4.8",
+    "note": "Vendored as a hardcoded dependency of DERO Hive. To update, refresh this directory from upstream and rerun npm run setup:mcp."
+  }
+}
