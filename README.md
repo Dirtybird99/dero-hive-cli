@@ -23,7 +23,7 @@ npm install -g https://github.com/Dirtybird99/dero-hive-cli/releases/latest/down
 To pin this release, replace the URL with:
 
 ```text
-https://github.com/Dirtybird99/dero-hive-cli/releases/download/v0.1.0/dero-hive-cli.tgz
+https://github.com/Dirtybird99/dero-hive-cli/releases/download/v0.2.0/dero-hive-cli.tgz
 ```
 
 The release also publishes `SHA256SUMS` for manual artifact verification.
@@ -53,13 +53,13 @@ hive
 
 The launch directory becomes the tool workspace. Use `hive -C path/to/project` to select another directory.
 
-Add a model provider interactively:
+After the interface opens, press **F2** and select **Providers** to add a model provider. The headless CLI offers the same setup:
 
 ```bash
 hive provider add
 ```
 
-Choose Codex to use its ChatGPT browser sign-in, or choose an API provider and enter its key at the prompt. Refresh a provider's model list when needed:
+Choose Codex to use its ChatGPT browser sign-in, or choose an API provider and enter its key at the prompt. Refresh a provider's model list from Settings or the CLI when needed:
 
 ```bash
 hive provider list
@@ -67,6 +67,30 @@ hive provider refresh PROVIDER_ID
 ```
 
 Run `hive --help` for non-interactive commands. Inside the full-screen interface, type `/` for commands, `?` for help, or `/shortcuts` for keyboard controls.
+
+## Providers
+
+Press **F2** to open **Settings**, then select **Providers** to add a provider. API-backed providers fetch their model list after being saved.
+
+| Provider | Authentication | Notes |
+|---|---|---|
+| Codex (ChatGPT) | ChatGPT browser sign-in | Saving starts model discovery automatically. Codex credentials are managed by Codex, not stored by DERO Hive. |
+| OpenAI | API key | Uses the OpenAI-compatible chat endpoint. |
+| Anthropic | API key | Uses the native Messages API. |
+| OpenRouter | API key | Routes to supported upstream models. |
+| Groq, OpenCode, MiniMax, Kimi, Moonshot | API key or subscription key | Use their documented OpenAI-compatible endpoints. |
+| Ollama | None by default | Uses locally installed models. |
+| Custom | Provider-defined | Uses a provider-defined OpenAI-compatible endpoint. |
+
+### Codex (ChatGPT) setup
+
+1. Press **F2**, select **Providers**, add **Codex (ChatGPT)**, and save it.
+2. Complete the browser sign-in if Codex has no reusable local login session.
+3. DERO Hive automatically imports the available Codex models and their reported thinking levels.
+
+The Codex adapter stays alive for the terminal session. Normal messages reuse the existing ACP process and do not intentionally start another browser login. On Windows, the bundled Codex app-server is launched hidden to avoid console-window flashes.
+
+Codex normally stores reusable credentials in the operating-system credential store or `~/.codex/auth.json`. Treat `auth.json` as a password and never commit or share it.
 
 ## DERO MCP server
 
@@ -172,6 +196,8 @@ npm run lint
 npm test
 npm run build
 ```
+
+See [TESTING.md](TESTING.md) for the current coverage ledger and release acceptance boundaries.
 
 ## Data and security
 

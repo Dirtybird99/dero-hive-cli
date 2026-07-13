@@ -3,7 +3,7 @@ import { parseSSE } from './streaming';
 import type { ProviderConfig, Message, ToolDefinition, ContentPart } from '@shared/types';
 import { supportsOpenAIReasoningEffort } from '@shared/thinkingCapabilities';
 import { APP_VERSION } from '@shared/version';
-import { logger } from '../utils/logger';
+import { logger, redactSensitive } from '../utils/logger';
 
 // Kimi Code's docs explicitly require tools to identify themselves via the
 // User-Agent header: "Please maintain the tool's real identity identifier
@@ -19,11 +19,11 @@ const USER_AGENT = `DERO-Hive/${APP_VERSION}`;
 function extractErrorMessage(body: string): string | null {
   try {
     const j = JSON.parse(body) as { error?: { message?: string } | string; message?: string };
-    if (typeof j.error === 'string') return j.error;
-    if (j.error?.message) return j.error.message;
-    if (j.message) return j.message;
+    if (typeof j.error === 'string') return redactSensitive(j.error);
+    if (j.error?.message) return redactSensitive(j.error.message);
+    if (j.message) return redactSensitive(j.message);
   } catch { /* not JSON */ }
-  return body ? body.slice(0, 200) : null;
+  return body ? redactSensitive(body.slice(0, 200)) : null;
 }
 
 // OpenAI Chat Completions compatible adapter. Works with any service that
@@ -32,6 +32,11 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   readonly id: string;
   constructor(private readonly cfg: ProviderConfig, private readonly apiKey: string) {
     this.id = cfg.id;
+  }
+
+  private safeError(value: string): string {
+    const redacted = redactSensitive(value);
+    return this.apiKey ? redacted.replaceAll(this.apiKey, '[REDACTED]') : redacted;
   }
 
   async testConnection(): Promise<{ ok: boolean; error?: string; models?: string[]; hint?: string }> {
@@ -56,7 +61,8 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       if (r.status === 401 || r.status === 403) {
         // Some gateways (OpenCode Zen/Go) return 401 for other problems too
         // (e.g. "model not supported") — surface the provider's own message.
-        const detail = extractErrorMessage(body);
+        const rawDetail = extractErrorMessage(body);
+        const detail = rawDetail ? this.safeError(rawDetail) : null;
         // Kimi Code returns the same 401 shape for a wrong key AND for the
         // HighSpeed model on a non-Allegretto plan — disambiguate the latter
         // so the user doesn't keep editing the wrong field.
@@ -76,7 +82,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       if (r.status === 404) {
         // Fall through to /models test below
       } else {
-        return { ok: false, error: `${r.status} ${r.statusText}: ${body.slice(0, 200)}` };
+        return { ok: false, error: `${r.status} ${r.statusText}: ${this.safeError(body.slice(0, 200))}` };
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -98,7 +104,8 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       }
       // 401/403 with /models usually means the key is wrong; report that early.
       if (r.status === 401 || r.status === 403) {
-        const detail = extractErrorMessage(await r.text());
+        const rawDetail = extractErrorMessage(await r.text());
+        const detail = rawDetail ? this.safeError(rawDetail) : null;
         return { ok: false, error: `Auth failed (${r.status})${detail ? `: ${detail}` : ': check your API key.'}`, hint: 'Edit the provider and re-enter the key.' };
       }
       // 404: try common URL variants
@@ -296,8 +303,9 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
     if (!response.ok) {
       const errText = await response.text();
-      logger.debug('openai', `response error ${response.status}: ${errText.slice(0, 500)}`);
-      yield { type: 'error', error: `${response.status} ${response.statusText}: ${errText.slice(0, 500)}` };
+      const safeError = this.safeError(errText.slice(0, 500));
+      logger.debug('openai', `response error ${response.status}: ${safeError}`);
+      yield { type: 'error', error: `${response.status} ${response.statusText}: ${safeError}` };
       return;
     }
 

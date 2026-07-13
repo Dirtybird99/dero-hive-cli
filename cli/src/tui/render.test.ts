@@ -89,6 +89,20 @@ function ScopedComposerProbe({ scope }: { scope: 'composer' | 'overlay' }): JSX.
   });
 }
 
+const secretStdout = new PassThrough() as PassThrough & NodeJS.WriteStream;
+Object.assign(secretStdout, { columns: 40, rows: 4, isTTY: true });
+let secretOutput = '';
+secretStdout.on('data', (chunk) => { secretOutput += chunk.toString(); });
+const secretComposer = render(React.createElement(ComposerInput, {
+  value: 'never-print-this', onChange() {}, onSubmit() {}, focus: false, masked: true
+}), { stdout: secretStdout, stdin, debug: true, patchConsole: false });
+const secretExited = secretComposer.waitUntilExit();
+await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+assert.doesNotMatch(secretOutput, /never-print-this/);
+assert.match(secretOutput, /•+/);
+secretComposer.unmount();
+await secretExited;
+
 try {
   await initHive();
   const instance = render(React.createElement(App, { options: { cwd: resolve('.') } }), {
@@ -108,6 +122,7 @@ try {
   assert.match(output, /DERO Hive/);
   assert.match(output, /New worktree/);
   assert.match(output, /Resume session/);
+  assert.match(output, /Connect model/);
   assert.match(output, /Changelog/);
   assert.match(output, /Quit/);
   assert.match(output, /ctrl\+s/);
@@ -174,6 +189,19 @@ try {
   stdin.write('\u001bOQ');
   await new Promise((resolveWait) => setTimeout(resolveWait, 80));
   assert.match(output.replace(ansiCsi, ''), /Settings/);
+  assert.match(output.replace(ansiCsi, ''), /Providers/);
+  output = '';
+  stdin.write('\r');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+  assert.match(output.replace(ansiCsi, ''), /Connect provider/);
+  output = '';
+  stdin.write('\r');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+  assert.match(output.replace(ansiCsi, ''), /OpenCode Zen/);
+  output = '';
+  for (const character of 'codex') stdin.write(character);
+  await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+  assert.match(output.replace(ansiCsi, ''), /Codex \(ChatGPT\).*browser sign-in/i);
   stdin.write('\u001b');
   await new Promise((resolveWait) => setTimeout(resolveWait, 60));
 

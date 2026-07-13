@@ -12,12 +12,14 @@ import * as projectService from '../services/project.js';
 import * as config from '../utils/config.js';
 import { TERMINAL_SYSTEM_PROMPT } from '../utils/systemPrompt.js';
 import { getContext, setPermissionHandler } from '../utils/init.js';
-import { closeConversationSessions, listProviders } from '../../../src/main/providers/registry.js';
+import { closeConversationSessions, listProviders, testConnection } from '../../../src/main/providers/registry.js';
+import { removeProvider, refreshProviderModels, refreshStaleProviders, saveProvider, setProviderEnabled } from '../../../src/main/providers/service.js';
 import { getDb } from '../../../src/main/db/client.js';
 import { deleteStoredAttachments, serializedAttachmentIds, storeAttachment } from '../../../src/main/utils/attachments.js';
 import { resolveAndValidate } from '../../../src/main/utils/pathPolicy.js';
 import { loadBundledSkills, loadUserSkills } from '../../../src/main/skills/loader.js';
 import { BUILTIN_SKILLS } from '../../../src/shared/defaults.js';
+import { PROVIDER_PRESETS } from '../../../src/shared/presets.js';
 import { BUILTIN_AGENTS, resolveAgent } from '../../../src/shared/agents.js';
 import { thinkingOptionsFor, usesDefaultThinkingOptions } from '../../../src/shared/thinkingCapabilities.js';
 import { normalizeToolApprovalMode, type AppSettings, type ContentPart, type MediaKind, type Message, type PermissionRule, type ProviderConfig, type ThinkingEffort, type TokenUsage, type ToolApprovalMode } from '../../../src/shared/types.js';
@@ -75,8 +77,24 @@ interface AppProps {
   options?: TuiLaunchOptions;
 }
 
-type OverlayKind = 'model' | 'reasoning' | 'theme' | 'agent' | 'sessions' | 'prompt-history' | 'approval' | 'help' | 'shortcuts' | 'tools' | 'mcp' | 'skills' | 'projects' | 'search' | 'settings' | 'extensions' | 'transcript';
+type OverlayKind = 'model' | 'reasoning' | 'theme' | 'agent' | 'sessions' | 'prompt-history' | 'approval' | 'help' | 'shortcuts' | 'tools' | 'mcp' | 'skills' | 'projects' | 'search' | 'settings' | 'extensions' | 'transcript' | 'providers' | 'provider-presets' | 'provider-manage' | 'provider-setup' | 'provider-remove';
 interface OverlayState { kind: OverlayKind; query: string; selected: number }
+type ProviderSetupField = 'id' | 'name' | 'baseUrl' | 'defaultModel' | 'apiKey';
+interface ProviderSetup {
+  presetId: string;
+  providerId: string;
+  name: string;
+  baseUrl: string;
+  defaultModel: string;
+  field: ProviderSetupField;
+  fields: ProviderSetupField[];
+}
+
+function providerSetupValue(setup: ProviderSetup, field: ProviderSetupField): string {
+  if (field === 'id') return setup.providerId;
+  if (field === 'apiKey') return '';
+  return setup[field];
+}
 interface PendingPermission extends PermissionView {
   requestId: string;
   projectPath?: string;
@@ -107,16 +125,17 @@ function launchDirectory(options: TuiLaunchOptions): string {
 }
 
 function pickModel(providers: ProviderConfig[], providerId?: string, modelId?: string): { providerId?: string; modelId?: string } {
-  let provider = providers.find((item) => item.id === providerId);
-  if (!provider && modelId) provider = providers.find((item) => item.models.some((model) => model.id === modelId));
-  provider ||= providers[0];
+  const enabled = providers.filter((item) => item.enabled && item.models.length);
+  let provider = enabled.find((item) => item.id === providerId);
+  if (!provider && modelId) provider = enabled.find((item) => item.models.some((model) => model.id === modelId));
+  provider ||= enabled[0];
   if (!provider) return {};
   const model = provider.models.find((item) => item.id === modelId) || provider.models[0];
   return { providerId: provider.id, modelId: model?.id };
 }
 
 function initialState(options: TuiLaunchOptions): InitialState {
-  const providers = listProviders().filter((provider) => provider.enabled);
+  const providers = listProviders();
   const previous = config.loadState();
   const defaults = config.getDefaultProvider();
   const cwd = launchDirectory(options);
@@ -168,7 +187,7 @@ function initialState(options: TuiLaunchOptions): InitialState {
     messages: conversationId ? conversationService.getMessages(conversationId) : [],
     cwd,
     providers,
-    error: providers.length ? undefined : 'No provider is configured. Exit and run: hive provider add'
+    error: providers.some((item) => item.enabled && item.models.length) ? undefined : 'No model is connected. Open Settings → Providers to connect one.'
   };
 }
 
@@ -290,7 +309,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
   const [conversationId, setConversationId] = useState(initial.conversationId);
   const [messages, setMessages] = useState(initial.messages);
   const [cwd, setCwd] = useState(initial.cwd);
-  const [providers] = useState(initial.providers);
+  const [providers, setProviders] = useState(initial.providers);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [liveText, setLiveText] = useState('');
@@ -300,6 +319,8 @@ export function App({ options = {} }: AppProps): JSX.Element {
   const [notice, setNotice] = useState<string | null>(initial.error || null);
   const [noticeError, setNoticeError] = useState(Boolean(initial.error));
   const [overlay, setOverlay] = useState<OverlayState | null>(null);
+  const [providerSetup, setProviderSetup] = useState<ProviderSetup | null>(null);
+  const [managedProviderId, setManagedProviderId] = useState<string | null>(null);
   const [permission, setPermission] = useState<PendingPermission | null>(null);
   const [welcomeIndex, setWelcomeIndex] = useState(0);
   const [shortcutExpanded, setShortcutExpanded] = useState<Set<string>>(() => new Set(['Essentials']));
@@ -344,7 +365,8 @@ export function App({ options = {} }: AppProps): JSX.Element {
     }
   });
   const agents = [...BUILTIN_AGENTS, ...(appSettings.customAgents || [])];
-  const provider = providers.find((item) => item.id === cliState.currentProviderId);
+  const enabledProviders = providers.filter((item) => item.enabled);
+  const provider = enabledProviders.find((item) => item.id === cliState.currentProviderId);
   const model = provider?.models.find((item) => item.id === cliState.currentModelId);
   const thinkingOptions = thinkingOptionsFor(provider?.presetId, model?.id, model);
   const reasoning: ThinkingEffort = cliState.reasoning || (usesDefaultThinkingOptions(provider?.presetId, model?.id, model) ? 'medium' : 'off');
@@ -418,6 +440,11 @@ export function App({ options = {} }: AppProps): JSX.Element {
     loopTimersRef.current.clear();
   }, []);
 
+  useEffect(() => {
+    const timer = setInterval(() => { void refreshStaleHttpProviders(); }, 6 * 60 * 60 * 1_000);
+    return () => { clearInterval(timer); };
+  }, []);
+
   function commitCli(patch: Partial<config.CliState>): config.CliState {
     const next = { ...cliRef.current, ...patch };
     cliRef.current = next;
@@ -457,6 +484,131 @@ export function App({ options = {} }: AppProps): JSX.Element {
     setNotice(null);
   }
 
+  function syncProviders(preferredProviderId?: string, preferredModelId?: string): ProviderConfig[] {
+    const next = listProviders();
+    setProviders(next);
+    const selection = pickModel(
+      next,
+      preferredProviderId || cliRef.current.currentProviderId,
+      preferredModelId || cliRef.current.currentModelId
+    );
+    if (selection.providerId !== cliRef.current.currentProviderId || selection.modelId !== cliRef.current.currentModelId) {
+      commitCli({ currentProviderId: selection.providerId, currentModelId: selection.modelId });
+      if (conversationRef.current && selection.providerId && selection.modelId) {
+        conversationService.updateConversation(conversationRef.current, { providerId: selection.providerId, model: selection.modelId });
+      }
+    }
+    return next;
+  }
+
+  function openProviders(): void {
+    syncProviders();
+    openOverlay('providers');
+    void refreshStaleHttpProviders();
+  }
+
+  async function refreshStaleHttpProviders(): Promise<void> {
+    await refreshStaleProviders();
+    syncProviders();
+  }
+
+  function beginProviderSetup(presetId: string, existing?: ProviderConfig, keyOnly = false): void {
+    const preset = PROVIDER_PRESETS.find((item) => item.id === presetId);
+    if (!preset) return;
+    const keyless = preset.id === 'codex' || preset.id === 'ollama';
+    const fields: ProviderSetupField[] = keyOnly
+      ? ['apiKey']
+      : preset.id === 'custom'
+        ? ['id', 'name', 'baseUrl', 'defaultModel', 'apiKey']
+        : keyless ? [] : ['apiKey'];
+    const taken = new Set(providers.map((item) => item.id));
+    let providerId = existing?.id || preset.id;
+    for (let suffix = 2; !existing && taken.has(providerId); suffix += 1) providerId = `${preset.id}-${suffix}`;
+    const setup: ProviderSetup = {
+      presetId: preset.id,
+      providerId,
+      name: existing?.name || preset.name,
+      baseUrl: existing?.baseUrl ?? preset.baseUrl,
+      defaultModel: existing?.models[0]?.id || preset.defaultModel,
+      field: fields[0] || 'apiKey',
+      fields
+    };
+    setProviderSetup(setup);
+    if (!fields.length) void persistProvider(setup);
+    else openOverlay('provider-setup', providerSetupValue(setup, fields[0]));
+  }
+
+  async function persistProvider(setup: ProviderSetup, apiKey?: string): Promise<void> {
+    if (streamingRef.current) {
+      showNotice('Stop the active response before changing providers.', true);
+      return;
+    }
+    setOverlay(null);
+    showNotice(setup.presetId === 'codex' ? 'Connecting Codex · complete browser sign-in if prompted…' : `Saving ${setup.name} and discovering models…`);
+    try {
+      const result = await saveProvider({
+        id: setup.providerId,
+        presetId: setup.presetId,
+        name: setup.name,
+        baseUrl: setup.baseUrl,
+        enabled: true,
+        defaultModel: setup.defaultModel,
+        ...(apiKey ? { apiKey } : {})
+      });
+      const next = syncProviders(setup.providerId, setup.defaultModel);
+      const saved = next.find((item) => item.id === setup.providerId);
+      setProviderSetup(null);
+      if (!result.discovery.ok) {
+        showNotice(`${saved?.name || setup.name} was saved, but model discovery failed: ${result.discovery.error || 'unknown error'}`, true);
+      } else {
+        showNotice(`${saved?.name || setup.name} connected · ${saved?.models.length || 0} model${saved?.models.length === 1 ? '' : 's'} available.`);
+      }
+    } catch (error) {
+      syncProviders(setup.providerId, setup.defaultModel);
+      setProviderSetup(null);
+      showNotice(`${setup.name} could not be connected: ${error instanceof Error ? error.message : String(error)}`, true);
+    }
+  }
+
+  function advanceProviderSetup(): void {
+    if (!providerSetup || overlay?.kind !== 'provider-setup') return;
+    const value = overlay.query.trim();
+    const field = providerSetup.field;
+    if ((field === 'id' || field === 'name' || field === 'baseUrl' || field === 'defaultModel') && !value) {
+      showNotice(`${field === 'baseUrl' ? 'Base URL' : field === 'defaultModel' ? 'Default model' : field === 'id' ? 'Provider id' : 'Display name'} is required.`, true);
+      return;
+    }
+    if (field === 'id' && !/^[a-z0-9][a-z0-9._-]*$/i.test(value)) {
+      showNotice('Provider id may contain letters, numbers, dots, dashes, and underscores.', true);
+      return;
+    }
+    if (field === 'id' && providers.some((item) => item.id === value)) {
+      showNotice(`Provider id “${value}” is already configured.`, true);
+      return;
+    }
+    if (field === 'baseUrl') {
+      try {
+        const url = new URL(value);
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error();
+        if (url.username || url.password) throw new Error();
+      } catch {
+        showNotice('Base URL must be http(s) and must not contain credentials.', true);
+        return;
+      }
+    }
+    const next = { ...providerSetup, ...(field === 'id' ? { providerId: value } : field === 'apiKey' ? {} : { [field]: value }) };
+    const index = next.fields.indexOf(field);
+    const nextField = next.fields[index + 1];
+    if (!nextField) {
+      void persistProvider(next, field === 'apiKey' ? value : undefined);
+      return;
+    }
+    next.field = nextField;
+    setProviderSetup(next);
+    setOverlay({ kind: 'provider-setup', query: providerSetupValue(next, nextField), selected: 0 });
+    setNotice(null);
+  }
+
   function setWorkingDirectory(nextPath: string, projectId?: string): void {
     const resolved = resolve(nextPath);
     if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
@@ -474,7 +626,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
   }
 
   function selectModel(providerId: string, modelId: string): void {
-    const selectedProvider = providers.find((item) => item.id === providerId);
+    const selectedProvider = enabledProviders.find((item) => item.id === providerId);
     const selectedModel = selectedProvider?.models.find((item) => item.id === modelId);
     if (!selectedProvider || !selectedModel) {
       showNotice('That model is no longer available.', true);
@@ -493,7 +645,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
   function startNewConversation(firstPrompt?: string): void {
     const state = cliRef.current;
     if (!state.currentProviderId || !state.currentModelId) {
-      showNotice('Configure a provider first with: hive provider add', true);
+      showNotice('Connect a model before starting a conversation.', true);
       return;
     }
     const created = conversationService.createConversation({
@@ -555,6 +707,10 @@ export function App({ options = {} }: AppProps): JSX.Element {
   function activateWelcomeAction(id: WelcomeActionId = WELCOME_ACTIONS[welcomeIndex]?.id || 'worktree'): void {
     if (id === 'worktree') void executeCommand('/worktree');
     else if (id === 'resume') openOverlay('sessions');
+    else if (id === 'models') {
+      if (enabledProviders.some((item) => item.models.length)) openOverlay('model');
+      else openProviders();
+    }
     else if (id === 'release-notes') void executeCommand('/release-notes');
     else exit();
   }
@@ -619,7 +775,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
     const state = cliRef.current;
     let activeConversation = conversationRef.current;
     if (!state.currentProviderId || !state.currentModelId) {
-      showNotice('No provider/model is selected. Run `hive provider add`, then reopen Hive.', true);
+      showNotice('No provider/model is selected. Connect one in Settings → Providers.', true);
       return;
     }
     if (!activeConversation) {
@@ -649,7 +805,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
     const abort = new AbortController();
     abortRef.current = abort;
 
-    const selectedProvider = providers.find((item) => item.id === state.currentProviderId);
+    const selectedProvider = enabledProviders.find((item) => item.id === state.currentProviderId);
     const selectedModel = selectedProvider?.models.find((item) => item.id === state.currentModelId);
     const effort = state.reasoning || (usesDefaultThinkingOptions(selectedProvider?.presetId, selectedModel?.id, selectedModel) ? 'medium' : 'off');
     const supported = thinkingOptionsFor(selectedProvider?.presetId, selectedModel?.id, selectedModel);
@@ -985,7 +1141,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
         const effortToken = tokens.at(-1)?.toLowerCase() as ThinkingEffort | undefined;
         const hasEffort = effortToken === 'off' || ['low', 'medium', 'high', 'max', 'xhigh'].includes(effortToken || '');
         const query = (hasEffort ? tokens.slice(0, -1) : tokens).join(' ').toLowerCase();
-        const target = providers.flatMap((item) => item.models.map((entry) => ({ provider: item, model: entry })))
+        const target = enabledProviders.flatMap((item) => item.models.map((entry) => ({ provider: item, model: entry })))
           .find((entry) => [
             `${entry.provider.id}/${entry.model.id}`,
             entry.model.id,
@@ -1725,10 +1881,13 @@ export function App({ options = {} }: AppProps): JSX.Element {
       `${item.label} ${item.detail || ''} ${item.group || ''} ${item.keywords || ''}`.toLowerCase().includes(query)
     );
     switch (overlay.kind) {
-      case 'model': return filter(providers.flatMap((item) => item.models.map((entry) => ({
-        id: `${item.id}\0${entry.id}`, label: entry.name || entry.id, detail: entry.id === entry.name ? undefined : entry.id,
-        group: item.name, keywords: `${item.id} ${entry.supportsReasoning ? 'reasoning' : ''} ${entry.supportsVision ? 'vision' : ''}`
-      }))));
+      case 'model': {
+        const models = enabledProviders.flatMap((item) => item.models.map((entry) => ({
+          id: `${item.id}\0${entry.id}`, label: entry.name || entry.id, detail: entry.id === entry.name ? undefined : entry.id,
+          group: item.name, keywords: `${item.id} ${entry.supportsReasoning ? 'reasoning' : ''} ${entry.supportsVision ? 'vision' : ''}`
+        })));
+        return models.length ? filter(models) : [{ id: 'providers', label: 'Connect a model', detail: 'Open Settings → Providers' }];
+      }
       case 'reasoning': return filter([
         { id: 'off', label: 'Default', detail: 'Use provider/model default' },
         ...thinkingOptions.map((item) => ({ id: item.id, label: item.label, detail: item.description }))
@@ -1805,6 +1964,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
         group: message.role
       })));
       case 'settings': return filter([
+        { id: 'providers', label: 'Providers', detail: providers.length ? `${providers.filter((item) => item.enabled).length} enabled · ${providers.length} configured` : 'Connect a model', keywords: 'provider llm api key codex ollama' },
         { id: 'model', label: 'Model', detail: `${provider?.name || 'none'} / ${model?.name || 'none'}`, keywords: 'provider llm' },
         { id: 'reasoning', label: 'Reasoning effort', detail: reasoning, keywords: 'thinking effort' },
         { id: 'agent', label: 'Agent profile', detail: activeAgent.name, keywords: 'persona mode' },
@@ -1819,6 +1979,54 @@ export function App({ options = {} }: AppProps): JSX.Element {
         { id: 'skills', label: 'Skills', detail: `${installedSkills.length} available`, keywords: 'extensions workflows' },
         { id: 'mcp', label: 'MCP servers', detail: `${getContext().mcpManager.getStatuses().filter((item) => item.connected).length} connected`, keywords: 'extensions connectors' }
       ]);
+      case 'providers': return filter([
+        ...providers.map((item) => ({
+          id: item.id,
+          label: item.name,
+          detail: `${item.enabled ? 'enabled' : 'disabled'} · ${item.models.length} model${item.models.length === 1 ? '' : 's'}${item.hasApiKey ? ' · credentials available' : ''}`,
+          group: 'configured',
+          keywords: `${item.presetId || ''} ${item.baseUrl}`
+        })),
+        { id: 'provider-connect', label: 'Connect provider', detail: 'Choose from built-in presets', group: 'action' }
+      ]);
+      case 'provider-presets': return filter(PROVIDER_PRESETS.map((item) => ({
+        id: item.id,
+        label: item.name,
+        detail: item.id === 'codex' ? 'ChatGPT browser sign-in' : item.id === 'ollama' ? 'Local · no key' : item.id === 'custom' ? 'Provider-defined endpoint' : item.defaultModel,
+        keywords: `${item.notes || ''} ${item.baseUrl}`
+      })));
+      case 'provider-manage': {
+        const managed = providers.find((item) => item.id === managedProviderId);
+        if (!managed) return [];
+        return filter([
+          { id: 'test', label: 'Test connection', detail: 'Verify credentials and endpoint' },
+          { id: 'refresh', label: 'Refresh models', detail: managed.modelsFetchedAt ? `Last fetched ${new Date(managed.modelsFetchedAt).toLocaleString()}` : 'Fetch now' },
+          ...(!['codex', 'ollama'].includes(managed.presetId || '') ? [{ id: 'key', label: managed.hasApiKey ? 'Replace API key' : 'Add API key', detail: 'Input stays masked' }] : []),
+          { id: 'toggle', label: managed.enabled ? 'Disable provider' : 'Enable provider', detail: managed.enabled ? 'Hide its models from the switcher' : 'Make its models available' },
+          { id: 'remove', label: 'Remove provider', detail: 'Requires confirmation' }
+        ]);
+      }
+      case 'provider-setup': {
+        if (!providerSetup) return [];
+        const labels: Record<ProviderSetupField, string> = {
+          id: 'Provider id', name: 'Display name', baseUrl: 'Base URL', defaultModel: 'Default model', apiKey: 'API key or subscription key'
+        };
+        const managed = providers.find((item) => item.id === providerSetup.providerId);
+        return [{
+          id: 'provider-field',
+          label: labels[providerSetup.field],
+          detail: providerSetup.field === 'apiKey'
+            ? managed?.hasApiKey ? 'Paste a replacement, or leave blank to keep the saved key' : 'Paste a key, or leave blank if authentication is not required'
+            : `Step ${providerSetup.fields.indexOf(providerSetup.field) + 1} of ${providerSetup.fields.length}`
+        }];
+      }
+      case 'provider-remove': {
+        const managed = providers.find((item) => item.id === managedProviderId);
+        return managed ? [
+          { id: 'confirm', label: `Remove ${managed.name}`, detail: 'This also removes its saved API key' },
+          { id: 'cancel', label: 'Cancel', detail: 'Keep this provider' }
+        ] : [];
+      }
       case 'search': {
         if (!query) return [];
         try {
@@ -1844,8 +2052,13 @@ export function App({ options = {} }: AppProps): JSX.Element {
       });
       return;
     }
+    if (kind === 'provider-setup') {
+      advanceProviderSetup();
+      return;
+    }
     setOverlay(null);
     if (kind === 'model') {
+      if (item.id === 'providers') { openProviders(); return; }
       const [providerId, modelId] = item.id.split('\0');
       selectModel(providerId, modelId);
     } else if (kind === 'reasoning') {
@@ -1883,7 +2096,9 @@ export function App({ options = {} }: AppProps): JSX.Element {
         showNotice('Transcript message view · run /transcript to return to the index.');
       }
     } else if (kind === 'settings') {
-      if (item.id === 'compact-mode') {
+      if (item.id === 'providers') {
+        openProviders();
+      } else if (item.id === 'compact-mode') {
         const enabled = !cliRef.current.compactMode;
         commitCli({ compactMode: enabled });
         showNotice(`Compact display ${enabled ? 'on' : 'off'}.`);
@@ -1910,6 +2125,54 @@ export function App({ options = {} }: AppProps): JSX.Element {
         showNotice(`Memory ${enabled ? 'enabled' : 'disabled'}.`);
       } else {
         openOverlay(item.id as Extract<OverlayKind, 'model' | 'reasoning' | 'agent' | 'approval' | 'theme' | 'skills' | 'mcp'>);
+      }
+    } else if (kind === 'providers') {
+      if (item.id === 'provider-connect') {
+        openOverlay('provider-presets');
+      } else {
+        setManagedProviderId(item.id);
+        openOverlay('provider-manage');
+      }
+    } else if (kind === 'provider-presets') {
+      beginProviderSetup(item.id);
+    } else if (kind === 'provider-manage') {
+      const managed = providers.find((entry) => entry.id === managedProviderId);
+      if (!managed) return;
+      if (streamingRef.current) {
+        showNotice('Stop the active response before changing providers.', true);
+        return;
+      }
+      if (item.id === 'key') {
+        beginProviderSetup(managed.presetId || 'custom', managed, true);
+      } else if (item.id === 'test') {
+        showNotice(`Testing ${managed.name}…`);
+        const result = await testConnection(managed.id);
+        showNotice(result.ok ? `${managed.name} is reachable.` : `${managed.name} test failed: ${result.error || 'unknown error'}`, !result.ok);
+      } else if (item.id === 'refresh') {
+        showNotice(`Refreshing ${managed.name} models…`);
+        const result = await refreshProviderModels(managed.id);
+        syncProviders(managed.id);
+        showNotice(result.ok ? `${managed.name} models refreshed · ${result.models?.length || 0} available.` : `${managed.name} refresh failed: ${result.error || 'unknown error'}`, !result.ok);
+      } else if (item.id === 'toggle') {
+        const result = setProviderEnabled(managed.id, !managed.enabled);
+        syncProviders();
+        showNotice(result.ok ? `${managed.name} ${managed.enabled ? 'disabled' : 'enabled'}.` : result.error || 'Provider update failed.', !result.ok);
+      } else if (item.id === 'remove') {
+        openOverlay('provider-remove');
+      }
+    } else if (kind === 'provider-remove') {
+      if (item.id === 'cancel') {
+        openOverlay('provider-manage');
+      } else if (managedProviderId) {
+        if (streamingRef.current) {
+          showNotice('Stop the active response before changing providers.', true);
+          return;
+        }
+        const managed = providers.find((entry) => entry.id === managedProviderId);
+        const result = removeProvider(managedProviderId);
+        syncProviders();
+        if (result.ok) setManagedProviderId(null);
+        showNotice(result.ok ? `${managed?.name || managedProviderId} removed.` : result.error || 'Provider removal failed.', !result.ok);
       }
     } else if (kind === 'projects') {
       const project = projectService.getProject(item.id);
@@ -2024,6 +2287,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
     if (overlay) {
       const items = overlayItems();
       if (key.escape || (key.ctrl && character === 'c')) {
+        if (overlay.kind === 'provider-setup') setProviderSetup(null);
         setOverlay(null);
       }
       else if (overlay.kind === 'shortcuts' && key.rightArrow) void chooseOverlay();
@@ -2253,7 +2517,10 @@ export function App({ options = {} }: AppProps): JSX.Element {
           continue;
         }
         if (containsPoint(pickerCloseRef.current, event.x, event.y) && event.type === 'left-press') {
-          if (overlay) setOverlay(null);
+          if (overlay) {
+            if (overlay.kind === 'provider-setup') setProviderSetup(null);
+            setOverlay(null);
+          }
           else setInput('');
           continue;
         }
@@ -2291,8 +2558,11 @@ export function App({ options = {} }: AppProps): JSX.Element {
             model: 'Choose provider / model', reasoning: 'Reasoning effort', theme: 'Terminal theme', agent: 'Agent profile',
             sessions: 'Resume conversation', 'prompt-history': 'Prompt history', approval: 'Tool approval', help: 'Commands', tools: 'Available tools',
             shortcuts: 'Keyboard shortcuts', mcp: 'MCP servers', skills: 'Skills', projects: 'Projects', search: 'Search messages', settings: 'Settings',
-            extensions: 'Extensions', transcript: 'Transcript'
-          }[contentOverlay.kind]} items={pickerItems} selected={contentOverlay.selected} theme={theme} hint="↑↓ move · type to filter · Enter select · Esc close" maxItems={Math.max(3, Math.min(9, dimensions.rows - 14))} width={overlayWidth} itemRefs={pickerItemRefs} closeRef={pickerCloseRef} />
+            extensions: 'Extensions', transcript: 'Transcript', providers: 'Providers', 'provider-presets': 'Connect provider',
+            'provider-manage': providers.find((item) => item.id === managedProviderId)?.name || 'Manage provider',
+            'provider-setup': PROVIDER_PRESETS.find((item) => item.id === providerSetup?.presetId)?.name || 'Provider setup',
+            'provider-remove': 'Confirm provider removal'
+          }[contentOverlay.kind]} items={pickerItems} selected={contentOverlay.selected} theme={theme} hint={contentOverlay.kind === 'provider-setup' ? 'Type a value · Enter continue · Esc cancel' : '↑↓ move · type to filter · Enter select · Esc close'} maxItems={Math.max(3, Math.min(9, dimensions.rows - 14))} width={overlayWidth} itemRefs={pickerItemRefs} closeRef={pickerCloseRef} />
         ) : (
           <Transcript
             messages={messages.slice(displayFrom)} live={liveMessage} tools={toolActivities} theme={theme}
@@ -2352,8 +2622,9 @@ export function App({ options = {} }: AppProps): JSX.Element {
               }}
               focus={!permission && !scrollbackFocused}
               multiline={Boolean(cliState.multilineMode) && !overlay}
-              inputKey={overlay ? 'overlay' : 'composer'}
-              placeholder={overlay ? 'filter…' : streaming ? 'Type to queue a follow-up…' : welcome ? '' : 'Ask Hive…'}
+              inputKey={overlay?.kind === 'provider-setup' ? `provider-${providerSetup?.field || 'setup'}` : overlay ? 'overlay' : 'composer'}
+              masked={overlay?.kind === 'provider-setup' && providerSetup?.field === 'apiKey'}
+              placeholder={overlay?.kind === 'provider-setup' ? providerSetup?.field === 'apiKey' ? 'optional' : 'type value…' : overlay ? 'filter…' : streaming ? 'Type to queue a follow-up…' : welcome ? '' : 'Ask Hive…'}
             />
           </Box>
         </Box>

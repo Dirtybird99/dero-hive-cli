@@ -47,7 +47,7 @@ function contentText(message: Message): string {
   }).filter(Boolean).join('\n');
 }
 
-export function ComposerInput({ value, onChange, onSubmit, placeholder = '', focus = true, multiline = false, inputKey = 'composer' }: {
+export function ComposerInput({ value, onChange, onSubmit, placeholder = '', focus = true, multiline = false, inputKey = 'composer', masked = false }: {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
@@ -55,6 +55,7 @@ export function ComposerInput({ value, onChange, onSubmit, placeholder = '', foc
   focus?: boolean;
   multiline?: boolean;
   inputKey?: string;
+  masked?: boolean;
 }): JSX.Element {
   const [cursor, setCursor] = useState(value.length);
   const [selectedAll, setSelectedAll] = useState(false);
@@ -136,13 +137,14 @@ export function ComposerInput({ value, onChange, onSubmit, placeholder = '', foc
     if (!placeholder) return <Text inverse> </Text>;
     return <Text><Text inverse>{placeholder[0]}</Text><Text dimColor>{placeholder.slice(1)}</Text></Text>;
   }
-  if (selectedAll && focus) return <Text inverse>{value}</Text>;
-  if (!focus) return <Text>{value}</Text>;
+  const display = masked ? '•'.repeat(value.length) : value;
+  if (selectedAll && focus) return <Text inverse>{display}</Text>;
+  if (!focus) return <Text>{display}</Text>;
   return (
     <Text>
-      {value.slice(0, cursor)}
-      <Text inverse>{value[cursor] || ' '}</Text>
-      {value.slice(cursor + (cursor < value.length ? 1 : 0))}
+      {display.slice(0, cursor)}
+      <Text inverse>{display[cursor] || ' '}</Text>
+      {display.slice(cursor + (cursor < display.length ? 1 : 0))}
     </Text>
   );
 }
@@ -188,6 +190,7 @@ function HiveMark({ theme }: { theme: ResolvedTerminalTheme }): JSX.Element {
 export const WELCOME_ACTIONS = [
   { id: 'worktree', label: 'New worktree', shortcut: 'ctrl+w' },
   { id: 'resume', label: 'Resume session', shortcut: 'ctrl+s' },
+  { id: 'models', label: 'Models', shortcut: '/model' },
   { id: 'release-notes', label: 'Changelog', shortcut: '/release-notes' },
   { id: 'quit', label: 'Quit', shortcut: 'ctrl+q' }
 ] as const;
@@ -226,10 +229,10 @@ export function Welcome({ theme, width, workspace, model, selected = 0, actionRe
       <Box flexDirection="column" borderStyle="round" borderColor={theme.palette.border} marginTop={1} paddingX={1}>
         <Text><Text color={theme.palette.foreground} bold>DERO Hive</Text><Text color={theme.palette.subtle}>  {APP_VERSION}</Text></Text>
         <Text color={theme.palette.accent} bold>{shorten(model || 'Provider setup required', lineWidth)}</Text>
-        <Text color={theme.palette.muted}>{shorten(model ? workspaceName : 'hive provider add', lineWidth)}</Text>
+        <Text color={theme.palette.muted}>{shorten(model ? workspaceName : 'Settings → Providers', lineWidth)}</Text>
         <Box flexDirection="column" marginTop={1}>
           {WELCOME_ACTIONS.map((action, index) => (
-            <WelcomeAction key={action.id} {...action} selected={index === selected} theme={theme} nodeRef={(node) => { if (actionRefs) actionRefs.current[index] = node; }} />
+            <WelcomeAction key={action.id} {...action} label={action.id === 'models' ? model ? 'Switch model' : 'Connect model' : action.label} selected={index === selected} theme={theme} nodeRef={(node) => { if (actionRefs) actionRefs.current[index] = node; }} />
           ))}
         </Box>
         <Text color={theme.palette.subtle}>{shorten('↑↓ choose · Enter open · Ctrl+P commands', lineWidth)}</Text>
@@ -255,10 +258,10 @@ export function Welcome({ theme, width, workspace, model, selected = 0, actionRe
         <Box marginTop={1}>
           <Text color={theme.palette.accent} bold>{model ? shorten(model, 38) : 'Provider setup required'}</Text>
         </Box>
-        <Text color={theme.palette.muted}>{model ? `Workspace  ${shorten(workspaceName, 44)}` : 'Run hive provider add to connect a model.'}</Text>
+        <Text color={theme.palette.muted}>{model ? `Workspace  ${shorten(workspaceName, 44)}` : 'Open Settings → Providers to connect a model.'}</Text>
         <Box flexDirection="column" marginTop={1}>
           {WELCOME_ACTIONS.map((action, index) => (
-            <WelcomeAction key={action.id} {...action} selected={index === selected} theme={theme} nodeRef={(node) => { if (actionRefs) actionRefs.current[index] = node; }} />
+            <WelcomeAction key={action.id} {...action} label={action.id === 'models' ? model ? 'Switch model' : 'Connect model' : action.label} selected={index === selected} theme={theme} nodeRef={(node) => { if (actionRefs) actionRefs.current[index] = node; }} />
           ))}
         </Box>
       </Box>

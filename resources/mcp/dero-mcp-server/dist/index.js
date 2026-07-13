@@ -7,7 +7,11 @@ var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
 var __commonJS = (cb, mod2) => function __require() {
-  return mod2 || (0, cb[__getOwnPropNames(cb)[0]])((mod2 = { exports: {} }).exports, mod2), mod2.exports;
+  try {
+    return mod2 || (0, cb[__getOwnPropNames(cb)[0]])((mod2 = { exports: {} }).exports, mod2), mod2.exports;
+  } catch (e) {
+    throw mod2 = 0, e;
+  }
 };
 var __export = (target, all) => {
   for (var name in all)
@@ -6936,7 +6940,6 @@ function $constructor(name, initializer3, params) {
   Object.defineProperty(_, "name", { value: name });
   return _;
 }
-var $brand = Symbol("zod_brand");
 var $ZodAsyncError = class extends Error {
   constructor() {
     super(`Encountered Promise during synchronous parse. Use .parseAsync() instead.`);
@@ -9440,8 +9443,6 @@ function en_default() {
 }
 
 // node_modules/zod/v4/core/registries.js
-var $output = Symbol("ZodOutput");
-var $input = Symbol("ZodInput");
 var $ZodRegistry = class {
   constructor() {
     this._map = /* @__PURE__ */ new Map();
@@ -10366,6 +10367,7 @@ var JSONSchemaGenerator = class {
             _json.readOnly = true;
             break;
           }
+          // passthrough types
           case "promise": {
             this.process(def.innerType, params);
             result.ref = def.innerType;
@@ -10658,6 +10660,7 @@ function isTransforming(_schema, _ctx) {
     case "set": {
       return isTransforming(def.valueType, ctx);
     }
+    // inner types
     case "promise":
     case "optional":
     case "nonoptional":
@@ -10793,10 +10796,10 @@ var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
   };
   inst.clone = (def2, params) => clone(inst, def2, params);
   inst.brand = () => inst;
-  inst.register = (reg, meta) => {
+  inst.register = ((reg, meta) => {
     reg.add(inst, meta);
     return inst;
-  };
+  });
   inst.parse = (data, params) => parse2(inst, data, params, { callee: inst.parse });
   inst.safeParse = (data, params) => safeParse2(inst, data, params);
   inst.parseAsync = async (data, params) => parseAsync2(inst, data, params, { callee: inst.parseAsync });
@@ -12768,11 +12771,13 @@ function assertCompleteRequestPrompt(request) {
   if (request.params.ref.type !== "ref/prompt") {
     throw new TypeError(`Expected CompleteRequestPrompt, but got ${request.params.ref.type}`);
   }
+  void request;
 }
 function assertCompleteRequestResourceTemplate(request) {
   if (request.params.ref.type !== "ref/resource") {
     throw new TypeError(`Expected CompleteRequestResourceTemplate, but got ${request.params.ref.type}`);
   }
+  void request;
 }
 var CompleteResultSchema = ResultSchema.extend({
   completion: looseObject({
@@ -16836,7 +16841,7 @@ ZodNaN.create = (params) => {
     ...processCreateParams(params)
   });
 };
-var BRAND = Symbol("zod_brand");
+var BRAND = /* @__PURE__ */ Symbol("zod_brand");
 var ZodBranded = class extends ZodType2 {
   _parse(input) {
     const { ctx } = this._processInputParams(input);
@@ -17038,14 +17043,14 @@ var ostring = () => stringType().optional();
 var onumber = () => numberType().optional();
 var oboolean = () => booleanType().optional();
 var coerce = {
-  string: (arg) => ZodString2.create({ ...arg, coerce: true }),
-  number: (arg) => ZodNumber2.create({ ...arg, coerce: true }),
-  boolean: (arg) => ZodBoolean2.create({
+  string: ((arg) => ZodString2.create({ ...arg, coerce: true })),
+  number: ((arg) => ZodNumber2.create({ ...arg, coerce: true })),
+  boolean: ((arg) => ZodBoolean2.create({
     ...arg,
     coerce: true
-  }),
-  bigint: (arg) => ZodBigInt.create({ ...arg, coerce: true }),
-  date: (arg) => ZodDate.create({ ...arg, coerce: true })
+  })),
+  bigint: ((arg) => ZodBigInt.create({ ...arg, coerce: true })),
+  date: ((arg) => ZodDate.create({ ...arg, coerce: true }))
 };
 var NEVER2 = INVALID;
 
@@ -17073,10 +17078,10 @@ var ZodMiniType = /* @__PURE__ */ $constructor("ZodMiniType", (inst, def) => {
   };
   inst.clone = (_def, params) => clone(inst, _def, params);
   inst.brand = () => inst;
-  inst.register = (reg, meta) => {
+  inst.register = ((reg, meta) => {
     reg.add(inst, meta);
     return inst;
-  };
+  });
 });
 var ZodMiniObject = /* @__PURE__ */ $constructor("ZodMiniObject", (inst, def) => {
   $ZodObject.init(inst, def);
@@ -17245,7 +17250,7 @@ function isTerminal(status) {
 }
 
 // node_modules/zod-to-json-schema/dist/esm/Options.js
-var ignoreOverride = Symbol("Let zodToJsonSchema decide on which parser to use");
+var ignoreOverride = /* @__PURE__ */ Symbol("Let zodToJsonSchema decide on which parser to use");
 var defaultOptions = {
   name: void 0,
   $refStrategy: "root",
@@ -20221,7 +20226,7 @@ var Server = class extends Protocol {
 };
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/completable.js
-var COMPLETABLE_SYMBOL = Symbol.for("mcp.completable");
+var COMPLETABLE_SYMBOL = /* @__PURE__ */ Symbol.for("mcp.completable");
 function isCompletable(schema) {
   return !!schema && typeof schema === "object" && COMPLETABLE_SYMBOL in schema;
 }
@@ -22406,6 +22411,7 @@ var CborReader = class {
   constructor(bytes) {
     this.bytes = bytes;
   }
+  bytes;
   offset = 0;
   readByte() {
     if (this.offset >= this.bytes.length) throw new Error("cbor: unexpected EOF");
@@ -23040,7 +23046,7 @@ function sqrt9mod16(P) {
   const c2 = tn(Fp_, c1);
   const c3 = tn(Fp_, Fp_.neg(c1));
   const c4 = (P + _7n) / _16n;
-  return (Fp4, n) => {
+  return ((Fp4, n) => {
     const F = Fp4;
     let tv1 = F.pow(n, c4);
     let tv2 = F.mul(tv1, c1);
@@ -23054,7 +23060,7 @@ function sqrt9mod16(P) {
     const root = F.cmov(tv1, tv2, e3);
     assertIsSquare(F, root, n);
     return root;
-  };
+  });
 }
 function tonelliShanks(P) {
   if (P < _3n)
@@ -25411,6 +25417,7 @@ var Cursor = class {
   constructor(bytes) {
     this.bytes = bytes;
   }
+  bytes;
   offset = 0;
   remaining() {
     return this.bytes.length - this.offset;
@@ -28202,7 +28209,7 @@ var newHeadersFromIncoming = (incoming) => {
   }
   return new Headers(headerRecord);
 };
-var wrapBodyStream = Symbol("wrapBodyStream");
+var wrapBodyStream = /* @__PURE__ */ Symbol("wrapBodyStream");
 var newRequestFromIncoming = (method, url, headers, incoming, abortController) => {
   const init = {
     method,
@@ -28250,13 +28257,13 @@ var newRequestFromIncoming = (method, url, headers, incoming, abortController) =
   }
   return new Request(url, init);
 };
-var getRequestCache = Symbol("getRequestCache");
-var requestCache = Symbol("requestCache");
-var incomingKey = Symbol("incomingKey");
-var urlKey = Symbol("urlKey");
-var headersKey = Symbol("headersKey");
-var abortControllerKey = Symbol("abortControllerKey");
-var getAbortController = Symbol("getAbortController");
+var getRequestCache = /* @__PURE__ */ Symbol("getRequestCache");
+var requestCache = /* @__PURE__ */ Symbol("requestCache");
+var incomingKey = /* @__PURE__ */ Symbol("incomingKey");
+var urlKey = /* @__PURE__ */ Symbol("urlKey");
+var headersKey = /* @__PURE__ */ Symbol("headersKey");
+var abortControllerKey = /* @__PURE__ */ Symbol("abortControllerKey");
+var getAbortController = /* @__PURE__ */ Symbol("getAbortController");
 var requestPrototype = {
   get method() {
     return this[incomingKey].method || "GET";
@@ -28309,7 +28316,7 @@ var requestPrototype = {
     }
   });
 });
-Object.defineProperty(requestPrototype, Symbol.for("nodejs.util.inspect.custom"), {
+Object.defineProperty(requestPrototype, /* @__PURE__ */ Symbol.for("nodejs.util.inspect.custom"), {
   value: function(depth, options, inspectFn) {
     const props = {
       method: this.method,
@@ -28358,9 +28365,9 @@ var newRequest = (incoming, defaultHostname) => {
   req[urlKey] = url.href;
   return req;
 };
-var responseCache = Symbol("responseCache");
-var getResponseCache = Symbol("getResponseCache");
-var cacheKey = Symbol("cache");
+var responseCache = /* @__PURE__ */ Symbol("responseCache");
+var getResponseCache = /* @__PURE__ */ Symbol("getResponseCache");
+var cacheKey = /* @__PURE__ */ Symbol("cache");
 var GlobalResponse = global.Response;
 var Response2 = class _Response {
   #body;
@@ -28424,7 +28431,7 @@ var Response2 = class _Response {
     }
   });
 });
-Object.defineProperty(Response2.prototype, Symbol.for("nodejs.util.inspect.custom"), {
+Object.defineProperty(Response2.prototype, /* @__PURE__ */ Symbol.for("nodejs.util.inspect.custom"), {
   value: function(depth, options, inspectFn) {
     const props = {
       status: this.status,
@@ -28505,8 +28512,8 @@ var X_ALREADY_SENT = "x-hono-already-sent";
 if (typeof global.crypto === "undefined") {
   global.crypto = crypto2;
 }
-var outgoingEnded = Symbol("outgoingEnded");
-var incomingDraining = Symbol("incomingDraining");
+var outgoingEnded = /* @__PURE__ */ Symbol("outgoingEnded");
+var incomingDraining = /* @__PURE__ */ Symbol("incomingDraining");
 var DRAIN_TIMEOUT_MS = 500;
 var MAX_DRAIN_BYTES = 64 * 1024 * 1024;
 var drainIncoming = (incoming) => {
