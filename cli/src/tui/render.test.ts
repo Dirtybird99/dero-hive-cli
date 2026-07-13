@@ -96,6 +96,7 @@ try {
     stdout,
     stderr: process.stderr,
     exitOnCtrlC: false,
+    debug: true,
     patchConsole: false
   });
   const exited = instance.waitUntilExit();
@@ -338,7 +339,7 @@ try {
   conversations.persistMessage(seeded.id, { id: 'seed-user', role: 'user', content: 'seeded-user-marker', createdAt: Date.now() });
   conversations.persistMessage(seeded.id, { id: 'seed-assistant', role: 'assistant', content: 'seeded-assistant-marker', createdAt: Date.now() + 1 });
   const seededApp = render(React.createElement(App, { options: { cwd: resolve('.'), conversation: seeded.id } }), {
-    stdin, stdout, stderr: process.stderr, exitOnCtrlC: false, patchConsole: false
+    stdin, stdout, stderr: process.stderr, exitOnCtrlC: false, debug: true, patchConsole: false
   });
   const seededExited = seededApp.waitUntilExit();
   await new Promise((resolveWait) => setTimeout(resolveWait, 100));
