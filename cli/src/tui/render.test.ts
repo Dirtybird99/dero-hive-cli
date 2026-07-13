@@ -99,7 +99,10 @@ try {
     patchConsole: false
   });
   const exited = instance.waitUntilExit();
-  await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+  const escape = String.fromCharCode(27);
+  for (let attempt = 0; attempt < 100 && (!/DERO Hive/.test(output) || !output.includes(`${escape}]10;#e1e1e1`)); attempt += 1) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
   if (!/DERO Hive/.test(output)) process.stderr.write(output);
   assert.match(output, /DERO Hive/);
   assert.match(output, /New worktree/);
@@ -109,7 +112,6 @@ try {
   assert.match(output, /ctrl\+s/);
   assert.match(output, /ctrl\+x/);
   assert.doesNotMatch(output, /✦/, 'reduced motion must keep the logo static');
-  const escape = String.fromCharCode(27);
   const ansiCsi = new RegExp(`${escape}\\[[0-?]*[ -/]*[@-~]`, 'g');
   assert.ok(output.includes(`${escape}]10;#e1e1e1`));
   assert.ok(output.includes(`${escape}]11;#141414`));
