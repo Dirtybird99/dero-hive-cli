@@ -745,6 +745,7 @@ export interface SimulatorStartOptions {
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
+  detached?: boolean;
 }
 
 export interface SimulatorHealth {

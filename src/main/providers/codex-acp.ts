@@ -496,6 +496,11 @@ export class CodexAcpAdapter implements ProviderAdapter {
     }
 
     await this.configureSession(runtime, session, req.model, req.reasoning?.effort);
+    if (req.signal?.aborted) {
+      runtime.sessions.delete(req.conversationId);
+      await withTimeout(runtime.conn.closeSession({ sessionId: session.sessionId }), 5_000, 'Codex session close timed out.').catch(() => {});
+      throw new DOMException('Request cancelled.', 'AbortError');
+    }
     if (req.planMode) runtime.readOnlySessions.add(session.sessionId);
     else runtime.readOnlySessions.delete(session.sessionId);
     const queue = new AsyncQueue<AcpEvent>();
@@ -523,7 +528,13 @@ export class CodexAcpAdapter implements ProviderAdapter {
       }
     }
 
-    const onAbort = (): void => { void runtime.conn.cancel({ sessionId: session!.sessionId }); };
+    let cancelPromise: Promise<void> | null = null;
+    const onAbort = (): void => {
+      cancelPromise ||= runtime.conn.cancel({ sessionId: session!.sessionId })
+        .then(() => {})
+        .catch((error) => { logger.debug('codex-acp', `cancel failed: ${String(error)}`); });
+      queue.push({ type: 'error', error: 'Request cancelled.' });
+    };
     req.signal?.addEventListener('abort', onAbort, { once: true });
     const promptPromise = runtime.conn.prompt({ sessionId: session.sessionId, prompt })
       .then(() => queue.push({ type: 'done' }))
@@ -535,14 +546,24 @@ export class CodexAcpAdapter implements ProviderAdapter {
         yield event;
         if (event.type === 'done' || event.type === 'error') break;
       }
-      await promptPromise;
-      session.bootstrapped = true;
-      session.systemPrompt = req.systemPrompt;
-      session.messageKeys = req.messages.map(acpMessageContextKey);
+      if (!req.signal?.aborted) {
+        await promptPromise;
+        session.bootstrapped = true;
+        session.systemPrompt = req.systemPrompt;
+        session.messageKeys = req.messages.map(acpMessageContextKey);
+      }
     } finally {
       req.signal?.removeEventListener('abort', onAbort);
       runtime.queues.delete(session.sessionId);
       runtime.permissionHandlers.delete(session.sessionId);
+      runtime.readOnlySessions.delete(session.sessionId);
+      if (req.signal?.aborted) {
+        runtime.sessions.delete(req.conversationId);
+        await Promise.allSettled([
+          withTimeout(cancelPromise || Promise.resolve(), 5_000, 'Codex cancellation timed out.'),
+          withTimeout(runtime.conn.closeSession({ sessionId: session.sessionId }), 5_000, 'Codex session close timed out.')
+        ]);
+      }
     }
   }
 

@@ -41,10 +41,13 @@ export function getAdapter(id: string): ProviderAdapter | null {
 }
 
 export function clearAdapterCache(): void {
-  for (const adapter of providers.values()) {
-    try { void adapter.dispose?.(); } catch { /* best-effort cleanup */ }
-  }
-  providers.clear();
+  for (const id of [...providers.keys()]) evictProviderAdapter(id);
+}
+
+export function evictProviderAdapter(id: string): void {
+  const adapter = providers.get(id);
+  providers.delete(id);
+  try { void adapter?.dispose?.(); } catch { /* best-effort cleanup */ }
 }
 
 export async function shutdownAdapterCache(): Promise<void> {

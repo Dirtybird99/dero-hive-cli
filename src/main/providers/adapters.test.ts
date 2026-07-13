@@ -16,6 +16,10 @@ const server = createServer((req, res) => {
   });
   res.setHeader('content-type', 'application/json');
   if (req.url === '/anthropic/models') res.end(JSON.stringify({ data: [{ id: 'claude-test' }] }));
+  else if (req.url === '/leak/chat/completions') {
+    res.statusCode = 500;
+    res.end(JSON.stringify({ error: { message: 'API key provided: leak-secret' } }));
+  }
   else res.end(JSON.stringify({ choices: [{ message: { content: 'pong' } }] }));
 });
 
@@ -38,9 +42,13 @@ try {
   assert.equal(requests[0]?.authorization, 'Bearer openai-secret');
   assert.equal(requests[0]?.userAgent, `DERO-Hive/${APP_VERSION}`);
 
+  const leaking = await new OpenAICompatibleAdapter(config('leak-test', `${base}/leak`, 'openai'), 'leak-secret').testConnection();
+  assert.equal(leaking.ok, false);
+  assert.doesNotMatch(leaking.error || '', /leak-secret/u);
+
   const anthropic = await new AnthropicAdapter(config('anthropic-test', `${base}/anthropic`, 'anthropic'), 'anthropic-secret').testConnection();
   assert.deepEqual(anthropic.models, ['claude-test']);
-  assert.equal(requests[1]?.apiKey, 'anthropic-secret');
+  assert.equal(requests[2]?.apiKey, 'anthropic-secret');
 
   process.env.HIVE_PROVIDER_OPEN_ROUTER_API_KEY = 'environment-secret';
   assert.equal(getProviderApiKey('open-router'), 'environment-secret');

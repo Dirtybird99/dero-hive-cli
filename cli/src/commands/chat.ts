@@ -244,12 +244,22 @@ async function runChatSession(oneShotPrompt?: string, options: {
         rl.close();
       }
     });
+    let cancelInputTail = '';
+    const cancelFromInput = (chunk: Buffer | string): void => {
+      const text = chunk.toString();
+      cancelInputTail = `${cancelInputTail}${text}`.slice(-32);
+      if (currentAbortController && (text.includes('\x03') || /(?:^|\r?\n)\/stop(?:\r?\n|$)/u.test(cancelInputTail))) {
+        currentAbortController.abort();
+      }
+    };
+    process.stdin.on('data', cancelFromInput);
 
     rl.setPrompt(chalk.green('> '));
     (rl as unknown as { history: string[] }).history = loadHistory();
 
     let inputBuffer: string[] = [];
     let inputTimer: ReturnType<typeof setTimeout> | null = null;
+    let sending = false;
 
     function flushInput(): void {
       if (inputBuffer.length === 0) return;
@@ -262,6 +272,12 @@ async function runChatSession(oneShotPrompt?: string, options: {
     async function processInput(text: string): Promise<void> {
       const trimmed = text.trim();
       if (!trimmed) { rl.prompt(); return; }
+
+      if (sending) {
+        if (trimmed === '/stop') currentAbortController?.abort();
+        else format.printInfo('A response is active. Press Ctrl+C or run /stop to cancel it.');
+        return;
+      }
 
       if (trimmed.startsWith('/')) {
         const handled = await handleSlashCommand(trimmed, state, conversationId!, providerId!, modelId!, projectDir());
@@ -292,9 +308,12 @@ async function runChatSession(oneShotPrompt?: string, options: {
         return;
       }
 
-      rl.pause();
-      await sendMessage(conversationId!, trimmed, providerId!, modelId!, projectDir(), classicSystemPrompt(state.systemPrompt));
-      rl.resume();
+      sending = true;
+      try {
+        await sendMessage(conversationId!, trimmed, providerId!, modelId!, projectDir(), classicSystemPrompt(state.systemPrompt));
+      } finally {
+        sending = false;
+      }
       rl.prompt();
     }
 
@@ -309,6 +328,7 @@ async function runChatSession(oneShotPrompt?: string, options: {
     await new Promise<void>((resolve) => {
       rl.on('close', () => resolve());
     });
+    process.stdin.off('data', cancelFromInput);
 
     if (inputTimer) { clearTimeout(inputTimer); flushInput(); }
     saveHistory((rl as unknown as { history?: string[] }).history);
@@ -366,8 +386,8 @@ export function chatCommand(): Command {
     .option('--system <prompt>', 'System prompt')
     .option('--conversation <id>', 'Resume a conversation')
     .option('-C, --cwd <path>', 'Workspace directory')
-    .action(async (prompt: string | undefined, options) => {
-      await startChatRepl(prompt, options);
+    .action(async (prompt: string | undefined, options, command: Command) => {
+      await startChatRepl(prompt, { ...(command.parent?.opts() || {}), ...options });
     });
 }
 
@@ -453,6 +473,7 @@ async function sendMessage(
         }
       }
     );
+    if (abort.signal.aborted) throw new DOMException('Request cancelled.', 'AbortError');
 
     if (firstDelta) clearTooltip();
     if (content) process.stdout.write('\n\n');

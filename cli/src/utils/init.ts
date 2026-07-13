@@ -7,6 +7,7 @@ import { ToolRegistry } from '../../../src/main/tools/registry.js';
 import type { PermissionRequest } from '../../../src/main/tools/registry.js';
 import { MediaManager } from '../../../src/main/media/manager.js';
 import { setMediaManager } from '../../../src/main/media/instance.js';
+import { shutdownAdapterCache } from '../../../src/main/providers/registry.js';
 
 export interface HiveContext {
   mcpManager: McpManager;
@@ -65,6 +66,7 @@ export function getContext(): HiveContext {
 }
 
 export async function shutdownHive(): Promise<void> {
+  await shutdownAdapterCache();
   if (context) {
     await context.mcpManager.shutdownAll();
     setMediaManager(null);

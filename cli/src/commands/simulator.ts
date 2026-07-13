@@ -30,7 +30,8 @@ export function simulatorCommand(): Command {
       const spinner = ora('Starting simulator...').start();
       const status = await manager.start({
         binaryPath: options.binary,
-        args: options.args
+        args: options.args,
+        detached: true
       });
       spinner.stop();
       if (status.error) format.printError(`Start failed: ${status.error}`);
@@ -42,7 +43,8 @@ export function simulatorCommand(): Command {
     .description('Stop the simulator')
     .action(async () => {
       const status = await manager.stop();
-      if (status.running) format.printError('Simulator still running');
+      if (status.error) format.printError(`Stop failed: ${status.error}`);
+      else if (status.running) format.printError('Simulator still running');
       else format.printSuccess('Simulator stopped');
     });
 

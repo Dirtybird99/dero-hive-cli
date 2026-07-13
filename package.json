@@ -1,6 +1,6 @@
 {
   "name": "dero-hive-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Terminal-native AI coding workspace with DERO tools, skills, and MCP support",
   "license": "MIT",
   "type": "module",
@@ -28,7 +28,8 @@
     "resources/skills",
     "LICENSE",
     "README.md",
-    "SECURITY.md"
+    "SECURITY.md",
+    "TESTING.md"
   ],
   "scripts": {
     "build": "node scripts/build-cli.mjs && node scripts/build-mcp.mjs",
@@ -39,7 +40,9 @@
     "hive": "node cli/bin/hive.js",
     "typecheck": "tsc --noEmit -p tsconfig.cli.json",
     "lint": "eslint \"cli/src/**/*.{ts,tsx}\" \"src/**/*.{ts,tsx}\"",
-    "test": "tsx cli/src/tui/commands.test.ts && tsx cli/src/tui/mouse.test.ts && tsx cli/src/services/conversation.test.ts && tsx cli/src/services/permissions.test.ts && tsx src/main/providers/codex-acp.test.ts && tsx src/main/providers/adapters.test.ts && tsx src/main/mcp/dero-packaged.test.ts && tsx cli/src/tui/render.test.ts",
+    "test": "tsx cli/src/tui/commands.test.ts && tsx cli/src/tui/mouse.test.ts && tsx cli/src/services/conversation.test.ts && tsx cli/src/services/permissions.test.ts && tsx src/main/providers/codex-acp.test.ts && tsx src/main/providers/adapters.test.ts && tsx src/main/providers/service.test.ts && tsx src/main/media/adapters.test.ts && tsx src/main/simulator/manager.test.ts && tsx src/main/tools/builtin.test.ts && tsx src/main/utils/logger.test.ts && tsx src/main/mcp/dero-packaged.test.ts && tsx cli/src/tui/render.test.ts",
+    "test:coverage": "node --import tsx --test --test-concurrency=1 --experimental-test-coverage --test-coverage-lines=80 --test-coverage-branches=70 --test-coverage-functions=80 --test-coverage-include=cli/src/tui/commands.ts --test-coverage-include=cli/src/tui/mouse.ts --test-coverage-include=cli/src/tui/components.tsx --test-coverage-include=src/main/providers/models.ts --test-coverage-include=src/main/providers/registry.ts --test-coverage-include=src/main/providers/service.ts --test-coverage-include=src/main/tools/builtin.ts --test-coverage-include=src/main/utils/logger.ts --test-coverage-include=src/shared/modelMetadata.ts --test-coverage-include=src/shared/presets.ts cli/src/services/conversation.test.ts cli/src/services/permissions.test.ts cli/src/tui/commands.test.ts cli/src/tui/mouse.test.ts cli/src/tui/render.test.ts src/main/providers/codex-acp.test.ts src/main/providers/adapters.test.ts src/main/providers/service.test.ts src/main/media/adapters.test.ts src/main/simulator/manager.test.ts src/main/tools/builtin.test.ts src/main/utils/logger.test.ts",
+    "test:mcp-conformance": "node scripts/mcp-conformance.mjs",
     "test:package": "node scripts/package-acceptance.mjs",
     "setup:simulator": "node scripts/setup-simulator.mjs"
   },
@@ -51,6 +54,7 @@
     "@agentclientprotocol/sdk": "^1.2.1",
     "@eslint/js": "^10.0.1",
     "@inquirer/prompts": "^7.0.0",
+    "@modelcontextprotocol/conformance": "0.1.16",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@noble/curves": "^2.2.0",
     "@types/better-sqlite3": "^7.6.11",
@@ -58,7 +62,7 @@
     "@types/react": "^18.3.11",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
-    "esbuild": "^0.21.5",
+    "esbuild": "0.28.1",
     "eslint": "^10.6.0",
     "eventsource-parser": "^3.0.0",
     "fast-glob": "^3.3.2",
@@ -74,7 +78,6 @@
   },
   "allowScripts": {
     "better-sqlite3@11.10.0": true,
-    "esbuild@0.21.5": true,
     "esbuild@0.28.1": true
   }
 }

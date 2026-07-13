@@ -1,7 +1,7 @@
 import type { ProviderAdapter, ProviderStreamRequest, ProviderStreamEvent } from './base';
 import { parseSSE } from './streaming';
 import type { ProviderConfig, ContentPart } from '@shared/types';
-import { logger } from '../utils/logger';
+import { logger, redactSensitive } from '../utils/logger';
 import { anthropicThinkingBudget, supportsAnthropicExtendedThinking } from '@shared/thinkingCapabilities';
 
 // Anthropic Messages API adapter. Translates OpenAI-style internal types to Anthropic format.
@@ -10,6 +10,11 @@ export class AnthropicAdapter implements ProviderAdapter {
   readonly id: string;
   constructor(private readonly cfg: ProviderConfig, private readonly apiKey: string) {
     this.id = cfg.id;
+  }
+
+  private safeError(value: string): string {
+    const redacted = redactSensitive(value);
+    return this.apiKey ? redacted.replaceAll(this.apiKey, '[REDACTED]') : redacted;
   }
 
   async testConnection(): Promise<{ ok: boolean; error?: string; models?: string[] }> {
@@ -150,7 +155,7 @@ export class AnthropicAdapter implements ProviderAdapter {
 
     if (!response.ok) {
       const errText = await response.text();
-      yield { type: 'error', error: `${response.status} ${response.statusText}: ${errText.slice(0, 500)}` };
+      yield { type: 'error', error: `${response.status} ${response.statusText}: ${this.safeError(errText.slice(0, 500))}` };
       return;
     }
 

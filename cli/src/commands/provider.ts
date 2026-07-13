@@ -1,12 +1,9 @@
 import { Command } from 'commander';
-import { input, select } from '@inquirer/prompts';
+import { input, password, select } from '@inquirer/prompts';
 import { getDb } from '../../../src/main/db/client.js';
-import { setSecret, deleteSecret } from '../../../src/main/utils/secrets.js';
 import { getProviderApiKey, testConnection } from '../../../src/main/providers/registry.js';
-import { fetchLiveModels } from '../../../src/main/providers/models.js';
+import { refreshProviderModels, removeProvider, saveProvider } from '../../../src/main/providers/service.js';
 import { logger } from '../../../src/main/utils/logger.js';
-import { applyKnownMetadata } from '../../../src/shared/modelMetadata.js';
-import type { ProviderModel } from '../../../src/shared/types.js';
 import * as format from '../utils/format.js';
 
 function rowToConfig(row: Record<string, unknown>) {
@@ -54,12 +51,17 @@ export function providerCommand(): Command {
     .option('--id <id>', 'Provider id')
     .option('--name <name>', 'Display name')
     .option('--base-url <url>', 'API base URL')
-    .option('--api-key <key>', 'API key')
+    .option('--clear-api-key', 'Remove the stored API key')
     .option('--model <model>', 'Default model')
     .option('--enabled', 'Enable provider', true)
     .action(async (options) => {
       const { PROVIDER_PRESETS, findPreset } = await import('../../../src/shared/presets.js');
       let preset = options.preset ? findPreset(options.preset) : undefined;
+      if (options.preset && !preset) {
+        format.printError(`Unknown provider preset: ${options.preset}`);
+        process.exitCode = 1;
+        return;
+      }
       if (!preset) {
         if (PROVIDER_PRESETS.length === 0) {
           format.printError('No provider presets available. Check the installation or use `--preset`, `--id`, `--name`, and `--base-url`.');
@@ -78,38 +80,27 @@ export function providerCommand(): Command {
 
       const id = options.id || (await input({ message: 'Provider id:', default: preset.id }));
       const name = options.name || (await input({ message: 'Display name:', default: preset.name }));
-      const baseUrl = options.baseUrl || (await input({ message: 'Base URL:', default: preset.baseUrl }));
-      const apiKey = options.apiKey || (await input({ message: 'API key (leave blank to skip):' }));
+      const keyless = preset.id === 'codex' || preset.id === 'ollama';
+      const baseUrl = options.baseUrl ?? (preset.id === 'codex' ? preset.baseUrl : await input({ message: 'Base URL:', default: preset.baseUrl }));
+      const apiKey = options.clearApiKey || keyless
+        ? undefined
+        : process.stdin.isTTY && process.stdout.isTTY
+          ? await password({ message: 'API key (leave blank to preserve):', mask: '•' })
+          : undefined;
       const defaultModel = options.model || preset.defaultModel;
 
-      const now = Date.now();
-      getDb()
-        .prepare(
-          `INSERT INTO providers (id, preset_id, name, base_url, api_key_ref, enabled, models, custom_headers, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-             preset_id = excluded.preset_id,
-             name = excluded.name,
-             base_url = excluded.base_url,
-             enabled = excluded.enabled,
-             models = excluded.models,
-             custom_headers = excluded.custom_headers,
-             updated_at = excluded.updated_at`
-        )
-        .run(
-          id,
-          preset.id,
-          name,
-          baseUrl,
-          null,
-          options.enabled ? 1 : 0,
-          JSON.stringify(preset.models),
-          JSON.stringify(preset.headers || {}),
-          now
-        );
-
-      if (apiKey) setSecret(`provider:${id}`, apiKey);
-      else deleteSecret(`provider:${id}`);
+      const saved = await saveProvider({
+        id,
+        presetId: preset.id,
+        name,
+        baseUrl,
+        apiKey: apiKey || undefined,
+        clearApiKey: options.clearApiKey,
+        enabled: options.enabled,
+        models: preset.models,
+        defaultModel,
+        customHeaders: preset.headers
+      });
 
       if (defaultModel) {
         const settings = getSetting<Record<string, unknown>>('appSettings', {}) || {};
@@ -120,6 +111,11 @@ export function providerCommand(): Command {
       }
 
       format.printSuccess(`Provider ${id} saved.`);
+      if (saved.discovery.ok) {
+        format.printInfo(`Discovered ${saved.discovery.models?.length || 0} models.`);
+      } else {
+        format.printInfo(`Model discovery failed; saved fallback model list: ${saved.discovery.error || 'unknown error'}`);
+      }
       logger.info('cli', `provider ${id} added/updated`);
     });
 
@@ -127,9 +123,9 @@ export function providerCommand(): Command {
     .command('remove <id>')
     .description('Remove a provider')
     .action((id) => {
-      deleteSecret(`provider:${id}`);
-      getDb().prepare('DELETE FROM providers WHERE id = ?').run(id);
-      format.printSuccess(`Provider ${id} removed.`);
+      const result = removeProvider(id);
+      if (result.ok) format.printSuccess(`Provider ${id} removed.`);
+      else format.printError(result.error || `Provider ${id} could not be removed.`);
     });
 
   cmd
@@ -149,42 +145,9 @@ export function providerCommand(): Command {
     .command('refresh <id>')
     .description('Refresh model list for a provider')
     .action(async (id) => {
-      const row = getDb().prepare('SELECT * FROM providers WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-      if (!row) {
-        format.printError(`Provider ${id} not found`);
-        return;
-      }
-      const cfg = rowToConfig(row);
-      const apiKey = getProviderApiKey(id) || '';
-      try {
-        const result = await fetchLiveModels(cfg.baseUrl, apiKey, cfg.presetId, cfg.customHeaders);
-        if (!result.ok || !result.models) {
-          format.printError(`Refresh failed: ${result.error || 'no models'}`);
-          return;
-        }
-        const models: ProviderModel[] = applyKnownMetadata(
-          result.models.map((m) => {
-            const detail = result.details?.[m];
-            return {
-              id: m,
-              name: detail?.name || m,
-              contextWindow: detail?.contextWindow,
-              maxOutput: detail?.maxOutput,
-              supportsVision: detail?.supportsVision,
-              supportsTools: detail?.supportsTools,
-              supportsReasoning: detail?.supportsReasoning
-            };
-          })
-        );
-        getDb().prepare('UPDATE providers SET models = ?, models_fetched_at = ? WHERE id = ?').run(
-          JSON.stringify(models),
-          Date.now(),
-          id
-        );
-        format.printSuccess(`Refreshed ${models.length} models for ${id}`);
-      } catch (err) {
-        format.printError(`Refresh failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      const result = await refreshProviderModels(id);
+      if (result.ok) format.printSuccess(`Refreshed ${result.models?.length || 0} models for ${id}`);
+      else format.printError(`Refresh failed: ${result.error || 'no models'}`);
     });
 
   cmd

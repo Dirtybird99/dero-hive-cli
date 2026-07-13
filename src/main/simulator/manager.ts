@@ -1,6 +1,6 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join, resolve as resolvePath } from 'node:path';
 import { logger } from '../utils/logger';
 import { paths } from '../utils/paths';
 import { resourcesRoot } from '../utils/paths';
@@ -10,6 +10,128 @@ const DEFAULT_BIN_NAME = process.platform === 'win32' ? 'derod-simulator.exe' : 
 const SECONDARY_BIN_NAME = process.platform === 'win32' ? 'simulator.exe' : 'simulator';
 const START_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 8_000;
+const CHILD_ENV_KEYS = [
+  'PATH', 'Path', 'PATHEXT', 'SystemRoot', 'WINDIR', 'ComSpec',
+  'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
+  'LANG', 'LC_ALL', 'DERO_NETWORK'
+] as const;
+
+interface DetachedSimulatorRecord {
+  pid: number;
+  binaryPath: string;
+  args: string[];
+  cwd: string;
+  startedAt: number;
+}
+
+const pidFile = (): string => join(paths.userData, 'simulator.pid.json');
+const startLockFile = (): string => join(paths.userData, 'simulator.start.lock');
+
+function claimStartLock(): boolean {
+  try {
+    writeFileSync(startLockFile(), String(Date.now()), { flag: 'wx', mode: 0o600 });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return false;
+    try {
+      const createdAt = Number(readFileSync(startLockFile(), 'utf8'));
+      if (Number.isFinite(createdAt) && Date.now() - createdAt > START_TIMEOUT_MS) {
+        unlinkSync(startLockFile());
+        writeFileSync(startLockFile(), String(Date.now()), { flag: 'wx', mode: 0o600 });
+        return true;
+      }
+    } catch { /* another process owns or replaced the lock */ }
+    return false;
+  }
+}
+
+function releaseStartLock(): void {
+  try { unlinkSync(startLockFile()); } catch { /* already released */ }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function canonicalPath(path: string): string {
+  try { return realpathSync.native(path); } catch { return resolvePath(path); }
+}
+
+function readDetachedRecord(): DetachedSimulatorRecord | null {
+  try {
+    const record = JSON.parse(readFileSync(pidFile(), 'utf8')) as Partial<DetachedSimulatorRecord>;
+    if (!Number.isSafeInteger(record.pid) || (record.pid ?? 0) <= 0 || typeof record.binaryPath !== 'string' ||
+        !Array.isArray(record.args) || !record.args.every((arg) => typeof arg === 'string') ||
+        typeof record.cwd !== 'string' || typeof record.startedAt !== 'number') throw new Error('Invalid simulator PID record.');
+    if (!processAlive(record.pid!)) {
+      unlinkSync(pidFile());
+      return null;
+    }
+    return record as DetachedSimulatorRecord;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      try { unlinkSync(pidFile()); } catch { /* already gone */ }
+    }
+    return null;
+  }
+}
+
+function simulatorEnvironment(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of CHILD_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return { ...env, ...extra };
+}
+
+function sameProcess(record: DetachedSimulatorRecord): boolean {
+  const expected = canonicalPath(record.binaryPath);
+  const startedNear = (actual: number): boolean => Number.isFinite(actual) && Math.abs(actual - record.startedAt) < 5_000;
+  const hasArgs = (command: string): boolean => !record.args[0] || command.includes(record.args[0]);
+  try {
+    if (process.platform === 'linux' || process.platform === 'darwin') {
+      const actualBinary = process.platform === 'linux' ? canonicalPath(readlinkSync(`/proc/${record.pid}/exe`)) : expected;
+      const output = spawnSync('ps', ['-p', String(record.pid), '-o', 'lstart=', '-o', 'command='], {
+        encoding: 'utf8', timeout: 3_000
+      }).stdout.trim();
+      const startedAt = Date.parse(output.slice(0, 24));
+      const command = output.slice(24).trim();
+      return actualBinary === expected && startedNear(startedAt) && command.includes(expected) && hasArgs(command);
+    }
+    if (process.platform === 'win32') {
+      const command = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${record.pid}'; if($p){[pscustomobject]@{ExecutablePath=$p.ExecutablePath;StartedAt=([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds();CommandLine=$p.CommandLine}|ConvertTo-Json -Compress}`;
+      const output = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
+        encoding: 'utf8', timeout: 3_000, windowsHide: true
+      }).stdout.trim();
+      const actual = JSON.parse(output) as { ExecutablePath?: string; StartedAt?: number; CommandLine?: string };
+      return !!actual.ExecutablePath && canonicalPath(actual.ExecutablePath).toLowerCase() === expected.toLowerCase()
+        && startedNear(actual.StartedAt ?? Number.NaN) && hasArgs(actual.CommandLine || '');
+    }
+  } catch { /* refuse to kill when ownership cannot be verified */ }
+  return false;
+}
+
+function removeDetachedRecord(pid?: number): void {
+  if (pid !== undefined) {
+    const current = readDetachedRecord();
+    if (current && current.pid !== pid) return;
+  }
+  try { unlinkSync(pidFile()); } catch { /* already gone */ }
+}
+
+async function waitForExit(pid: number, timeoutMs = STOP_TIMEOUT_MS): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (processAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return !processAlive(pid);
+}
 
 /**
  * Manages the DERO blockchain simulator (`derod-simulator`) as a child process.
@@ -58,28 +180,29 @@ export class SimulatorManager {
   }
 
   status(): SimulatorStatus {
+    const detached = this.proc ? null : readDetachedRecord();
     const knownBinary = this.binaryPath && existsSync(this.binaryPath)
       ? this.binaryPath
-      : SimulatorManager.detectBinaryPath();
+      : detached?.binaryPath ?? SimulatorManager.detectBinaryPath();
     return {
       installed: knownBinary !== null,
-      running: this.proc !== null,
+      running: this.proc !== null || detached !== null,
       starting: this.starting,
-      pid: this.proc?.pid ?? null,
-      binaryPath: this.binaryPath,
-      args: this.args,
-      cwd: this.cwd,
-      startedAt: this.startedAt,
+      pid: this.proc?.pid ?? detached?.pid ?? null,
+      binaryPath: this.binaryPath ?? detached?.binaryPath ?? null,
+      args: this.proc ? this.args : detached?.args ?? this.args,
+      cwd: this.proc ? this.cwd : detached?.cwd ?? this.cwd,
+      startedAt: this.proc ? this.startedAt : detached?.startedAt ?? this.startedAt,
       exitCode: this.exitCode,
       error: this.lastError
     };
   }
 
   async start(options: SimulatorStartOptions = {}): Promise<SimulatorStatus> {
-    if (this.proc || this.starting) return this.status();
+    if (this.starting || this.status().running) return this.status();
 
     const resolved = SimulatorManager.detectBinaryPath(options.binaryPath);
-    this.binaryPath = resolved ?? options.binaryPath?.trim() ?? null;
+    this.binaryPath = resolved ? canonicalPath(resolved) : options.binaryPath?.trim() ? canonicalPath(options.binaryPath.trim()) : null;
 
     if (!this.binaryPath || !existsSync(this.binaryPath)) {
       this.lastError = `Simulator binary not found. Place "${DEFAULT_BIN_NAME}" in resources/simulator/bin (or set a custom path via SIMULATOR_START).`;
@@ -103,6 +226,21 @@ export class SimulatorManager {
 
     logger.info('simulator', `starting ${this.binaryPath} ${this.args.join(' ')}`);
 
+    if (options.detached) {
+      if (!claimStartLock()) {
+        this.lastError = 'Another simulator start is already in progress.';
+        this.starting = false;
+        this.emit();
+        return this.status();
+      }
+      if (readDetachedRecord()) {
+        releaseStartLock();
+        this.starting = false;
+        this.emit();
+        return this.status();
+      }
+    }
+
     return new Promise<SimulatorStatus>((resolve) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -116,9 +254,10 @@ export class SimulatorManager {
       try {
         const child = spawn(this.binaryPath!, this.args, {
           cwd: this.cwd ?? undefined,
-          env: { ...process.env, ...(options.env ?? {}) },
+          env: simulatorEnvironment(options.env),
+          detached: options.detached,
           windowsHide: true,
-          stdio: ['ignore', 'pipe', 'pipe']
+          stdio: options.detached ? 'ignore' : ['ignore', 'pipe', 'pipe']
         });
 
         this.proc = child;
@@ -135,6 +274,17 @@ export class SimulatorManager {
         child.on('error', (err) => {
           logger.error('simulator', 'spawn error', err);
           this.lastError = err.message;
+          this.proc = null;
+          this.startedAt = null;
+          if (options.detached) removeDetachedRecord(child.pid);
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            this.starting = false;
+            this.emit(resolve);
+          } else {
+            this.emit();
+          }
         });
 
         child.on('exit', (code, signal) => {
@@ -142,6 +292,7 @@ export class SimulatorManager {
           this.exitCode = code;
           this.proc = null;
           this.startedAt = null;
+          if (options.detached) removeDetachedRecord(child.pid);
           if (settled) {
             this.starting = false;
             this.emit();
@@ -157,6 +308,28 @@ export class SimulatorManager {
           }
         });
 
+        if (!child.pid) {
+          this.proc = null;
+          throw new Error('Simulator process did not return a PID.');
+        }
+        if (options.detached) {
+          try {
+            writeFileSync(pidFile(), JSON.stringify({
+              pid: child.pid,
+              binaryPath: resolvePath(this.binaryPath!),
+              args: this.args,
+              cwd: this.cwd!,
+              startedAt: this.startedAt
+            } satisfies DetachedSimulatorRecord), { mode: 0o600 });
+          } catch (error) {
+            child.kill();
+            this.proc = null;
+            throw error;
+          }
+          child.unref();
+          releaseStartLock();
+        }
+
         // Once we've hooked everything up, declare "running" even if the
         // process hasn't emitted anything yet. We treat the child being alive
         // as success.
@@ -165,6 +338,7 @@ export class SimulatorManager {
         this.starting = false;
         this.emit(resolve);
       } catch (err) {
+        if (options.detached) releaseStartLock();
         if (!settled) {
           settled = true;
           clearTimeout(timer);
@@ -177,32 +351,37 @@ export class SimulatorManager {
   }
 
   async stop(): Promise<SimulatorStatus> {
-    if (!this.proc) {
+    const detached = this.proc ? null : readDetachedRecord();
+    if (!this.proc && !detached) {
+      this.starting = false;
+      this.emit();
+      return this.status();
+    }
+
+    if (detached) {
+      if (!sameProcess(detached)) {
+        removeDetachedRecord(detached.pid);
+        this.lastError = `Refused to stop PID ${detached.pid}: it is no longer the recorded simulator process.`;
+        this.emit();
+        return this.status();
+      }
+
+      this.lastError = null;
+      try { process.kill(detached.pid, 'SIGTERM'); } catch { /* already gone */ }
+      if (!await waitForExit(detached.pid) && sameProcess(detached)) {
+        try { process.kill(detached.pid, 'SIGKILL'); } catch { /* already gone */ }
+        await waitForExit(detached.pid, 1_000);
+      }
+      if (!processAlive(detached.pid)) removeDetachedRecord(detached.pid);
+      else this.lastError = `Simulator PID ${detached.pid} did not stop.`;
       this.starting = false;
       this.emit();
       return this.status();
     }
 
     const proc = this.proc;
-    const exited = new Promise<void>((resolve) => {
-      if (!proc) return resolve();
-      proc.once('exit', () => resolve());
-      try {
-        if (process.platform === 'win32') {
-          // Try graceful, then force.
-          proc.kill();
-        } else {
-          proc.kill('SIGTERM');
-        }
-      } catch {
-        // already gone
-        resolve();
-      }
-    });
-
-    const timeout = new Promise<void>((resolve) => setTimeout(resolve, STOP_TIMEOUT_MS));
-
-    await Promise.race([exited, timeout]);
+    try { proc!.kill('SIGTERM'); } catch { /* already gone */ }
+    await waitForExit(proc!.pid!);
 
     if (this.proc) {
       try {
@@ -226,7 +405,7 @@ export class SimulatorManager {
 
   async health(): Promise<SimulatorHealth> {
     const endpoint = 'http://127.0.0.1:20000/json_rpc';
-    if (!this.proc) return { reachable: false, endpoint, error: 'Simulator is not running.' };
+    if (!this.status().running) return { reachable: false, endpoint, error: 'Simulator is not running.' };
     const started = Date.now();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3_000);
@@ -248,7 +427,7 @@ export class SimulatorManager {
   }
 
   async chainInfo(): Promise<SimulatorChainInfo> {
-    if (!this.proc) throw new Error('Simulator is not running.');
+    if (!this.status().running) throw new Error('Simulator is not running.');
     const result = await this.callRpc<Record<string, unknown>>('DERO.GetInfo');
     const number = (key: string): number => typeof result[key] === 'number' ? result[key] : 0;
     const text = (key: string): string => typeof result[key] === 'string' ? result[key] : 'unknown';
@@ -263,13 +442,13 @@ export class SimulatorManager {
   }
 
   async createFixtureWallet(): Promise<{ address: string; scid: string }> {
-    if (!this.proc) throw new Error('Simulator is not running.');
+    if (!this.status().running) throw new Error('Simulator is not running.');
     const result = await this.callRpc<{ address?: string }>('DERO.GetRandomAddress');
     return { address: result.address || 'unknown', scid: '' };
   }
 
   async getContractState(scid: string, keys?: string[]): Promise<Record<string, unknown>> {
-    if (!this.proc) throw new Error('Simulator is not running.');
+    if (!this.status().running) throw new Error('Simulator is not running.');
     const result = await this.callRpc<{ valuesstring?: string[]; stringkeys?: string[] }>('DERO.GetSC', { scid, keys });
     const state: Record<string, unknown> = {};
     if (result.stringkeys && result.valuesstring) {
@@ -281,24 +460,24 @@ export class SimulatorManager {
   }
 
   async getBalance(address: string, scid?: string): Promise<{ balance: number; scid?: string }> {
-    if (!this.proc) throw new Error('Simulator is not running.');
+    if (!this.status().running) throw new Error('Simulator is not running.');
     const result = await this.callRpc<{ balance?: number; unlocked_balance?: number }>('DERO.GetEncryptedBalance', { address, scid });
     return { balance: result.balance ?? 0, scid };
   }
 
   async sendTransaction(txHex: string): Promise<{ txid: string }> {
-    if (!this.proc) throw new Error('Simulator is not running.');
+    if (!this.status().running) throw new Error('Simulator is not running.');
     const result = await this.callRpc<{ txid?: string }>('DERO.SendTransaction', { tx_hex: txHex });
     return { txid: result.txid || 'unknown' };
   }
 
   async getTransaction(txid: string): Promise<Record<string, unknown>> {
-    if (!this.proc) throw new Error('Simulator is not running.');
+    if (!this.status().running) throw new Error('Simulator is not running.');
     return this.callRpc<Record<string, unknown>>('DERO.GetTransaction', { txid });
   }
 
   async getHeight(): Promise<number> {
-    if (!this.proc) throw new Error('Simulator is not running.');
+    if (!this.status().running) throw new Error('Simulator is not running.');
     const result = await this.callRpc<{ height?: number }>('DERO.GetHeight');
     return result.height ?? 0;
   }

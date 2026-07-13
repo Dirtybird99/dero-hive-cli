@@ -29,11 +29,11 @@ await build({
   plugins: [{
     name: 'optional-react-devtools',
     setup(buildApi) {
-      buildApi.onResolve({ filter: /^react-devtools-core$/u }, () => ({
+      buildApi.onResolve({ filter: /^react-devtools-core$/ }, () => ({
         path: 'react-devtools-core',
         namespace: 'optional-stub'
       }));
-      buildApi.onLoad({ filter: /.*/u, namespace: 'optional-stub' }, () => ({
+      buildApi.onLoad({ filter: /.*/, namespace: 'optional-stub' }, () => ({
         contents: 'export default { connectToDevTools() {} };',
         loader: 'js'
       }));
