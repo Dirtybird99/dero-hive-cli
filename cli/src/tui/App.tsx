@@ -21,11 +21,11 @@ import { BUILTIN_SKILLS } from '../../../src/shared/defaults.js';
 import { BUILTIN_AGENTS, resolveAgent } from '../../../src/shared/agents.js';
 import { thinkingOptionsFor, usesDefaultThinkingOptions } from '../../../src/shared/thinkingCapabilities.js';
 import { normalizeToolApprovalMode, type AppSettings, type ContentPart, type MediaKind, type Message, type PermissionRule, type ProviderConfig, type ThinkingEffort, type TokenUsage, type ToolApprovalMode } from '../../../src/shared/types.js';
+import { APP_VERSION } from '../../../src/shared/version.js';
 import { commandSuggestions, parseSlashCommand, type CommandSuggestion } from './commands.js';
 import { listThemes, nextTheme, resolveTheme, type TerminalThemeId } from './themes.js';
 import { DISABLE_SGR_MOUSE, ENABLE_SGR_MOUSE, SgrMouseParser } from './mouse.js';
 import { CommandMenu, ComposerInput, Header, PermissionPrompt, Picker, StatusBar, Transcript, WELCOME_ACTIONS, type PermissionView, type PickerItem, type ToolActivity, type WelcomeActionId } from './components.js';
-import packageJson from '../../package.json';
 
 const execAsync = promisify(exec);
 const EMPTY_USAGE: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -1615,10 +1615,10 @@ export function App({ options = {} }: AppProps): JSX.Element {
           });
           if (!response.ok) throw new Error(`GitHub returned ${response.status}`);
           const release = await response.json() as { name?: string; tag_name?: string; body?: string; html_url?: string };
-          appendLocal(`## ${release.name || release.tag_name || `DERO Hive ${packageJson.version}`}\n\n${release.body?.trim() || 'No release notes were published.'}\n\n${release.html_url || 'https://github.com/Dirtybird99/dero-hive-cli/releases'}`);
+          appendLocal(`## ${release.name || release.tag_name || `DERO Hive ${APP_VERSION}`}\n\n${release.body?.trim() || 'No release notes were published.'}\n\n${release.html_url || 'https://github.com/Dirtybird99/dero-hive-cli/releases'}`);
           showNotice('Release notes loaded.');
         } catch (error) {
-          appendLocal(`## DERO Hive ${packageJson.version}\n\nRelease notes are unavailable: ${error instanceof Error ? error.message : String(error)}\n\nhttps://github.com/Dirtybird99/dero-hive-cli/releases`);
+          appendLocal(`## DERO Hive ${APP_VERSION}\n\nRelease notes are unavailable: ${error instanceof Error ? error.message : String(error)}\n\nhttps://github.com/Dirtybird99/dero-hive-cli/releases`);
         }
         return;
       }
@@ -1929,7 +1929,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
           await manager.ensureBundledServers('dero-mcp-server');
           const added = manager.getStatuses().find((entry) => entry.id === DERO_MCP_BUNDLED_ID);
           if (!added) {
-            showNotice('Bundled DERO MCP server is unavailable. Run npm run setup:mcp and try again.', true);
+            showNotice('Bundled DERO MCP server is unavailable. Reinstall DERO Hive CLI and try again.', true);
           } else if (added.error) {
             showNotice(`Added DERO MCP server, but connection failed: ${added.error}`, true);
           } else {

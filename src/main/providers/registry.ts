@@ -9,6 +9,11 @@ import { logger } from '../utils/logger';
 
 const providers = new Map<string, ProviderAdapter>();
 
+export function getProviderApiKey(id: string): string | undefined {
+  const envName = `HIVE_PROVIDER_${id.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`;
+  return process.env[envName]?.trim() || getSecret(`provider:${id}`);
+}
+
 // Heuristic to pick the right adapter based on baseUrl / presetId
 export function adapterFor(cfg: ProviderConfig): ProviderAdapter | null {
   if (!cfg.enabled) return null;
@@ -16,7 +21,7 @@ export function adapterFor(cfg: ProviderConfig): ProviderAdapter | null {
   if (cfg.presetId === 'codex') {
     return new CodexAcpAdapter(cfg);
   }
-  const apiKey = getSecret(`provider:${cfg.id}`);
+  const apiKey = getProviderApiKey(cfg.id);
   // Anthropic has its own API shape; only use AnthropicAdapter for actual Anthropic hosts
   if (cfg.presetId === 'anthropic' || /anthropic\.com/.test(cfg.baseUrl)) {
     return new AnthropicAdapter(cfg, apiKey || '');
@@ -70,7 +75,7 @@ function rowToConfig(row: Record<string, unknown>): ProviderConfig {
     name: row.name as string,
     baseUrl: row.base_url as string,
     apiKey: '', // intentionally blank — renderer never sees the real key
-    hasApiKey: !!getSecret(`provider:${row.id}`),
+    hasApiKey: !!getProviderApiKey(row.id as string),
     enabled: row.enabled === 1,
     models: safeJson(row.models as string, []),
     customHeaders: safeJson(row.custom_headers as string, {}),

@@ -1,8 +1,8 @@
 import { Command } from 'commander';
 import { input, select } from '@inquirer/prompts';
 import { getDb } from '../../../src/main/db/client.js';
-import { setSecret, getSecret, deleteSecret } from '../../../src/main/utils/secrets.js';
-import { testConnection } from '../../../src/main/providers/registry.js';
+import { setSecret, deleteSecret } from '../../../src/main/utils/secrets.js';
+import { getProviderApiKey, testConnection } from '../../../src/main/providers/registry.js';
 import { fetchLiveModels } from '../../../src/main/providers/models.js';
 import { logger } from '../../../src/main/utils/logger.js';
 import { applyKnownMetadata } from '../../../src/shared/modelMetadata.js';
@@ -42,7 +42,7 @@ export function providerCommand(): Command {
       }
       for (const row of rows) {
         const cfg = rowToConfig(row);
-        const hasKey = !!getSecret(`provider:${cfg.id}`);
+        const hasKey = !!getProviderApiKey(cfg.id);
         format.printInfo(format.formatProvider({ ...cfg, hasApiKey: hasKey, apiKey: '' }));
       }
     });
@@ -155,7 +155,7 @@ export function providerCommand(): Command {
         return;
       }
       const cfg = rowToConfig(row);
-      const apiKey = getSecret(`provider:${id}`) || '';
+      const apiKey = getProviderApiKey(id) || '';
       try {
         const result = await fetchLiveModels(cfg.baseUrl, apiKey, cfg.presetId, cfg.customHeaders);
         if (!result.ok || !result.models) {

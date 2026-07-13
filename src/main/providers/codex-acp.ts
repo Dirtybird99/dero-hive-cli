@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import type { ProviderAdapter, ProviderStreamRequest, ProviderStreamEvent } from './base';
 import type { ContentPart, Message, ProviderConfig, ProviderModel, ThinkingOption } from '@shared/types';
+import { APP_VERSION } from '@shared/version';
 import { logger } from '../utils/logger';
 import { getWorkspaceRoot, resolveWithinAllowed } from '../utils/pathPolicy';
 
@@ -363,7 +364,7 @@ export class CodexAcpAdapter implements ProviderAdapter {
     const conn = new sdk.ClientSideConnection(() => new CodexAcpClient(queues, permissionHandlers, readOnlySessions), stream);
     const init = await withTimeout(conn.initialize({
       protocolVersion: ACP_PROTOCOL_VERSION,
-      clientInfo: { name: 'DERO Hive', version: '0.1.0' },
+      clientInfo: { name: 'DERO Hive', version: APP_VERSION },
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
         session: { configOptions: { boolean: {} } }

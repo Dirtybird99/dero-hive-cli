@@ -21,14 +21,14 @@
   "files": [
     "cli/bin",
     "cli/dist",
-    "cli/package.json",
     "resources/mcp/dero-mcp-server/data",
     "resources/mcp/dero-mcp-server/dist",
     "resources/mcp/dero-mcp-server/LICENSE",
     "resources/mcp/dero-mcp-server/package.json",
     "resources/skills",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "SECURITY.md"
   ],
   "scripts": {
     "build": "node scripts/build-cli.mjs && node scripts/build-mcp.mjs",
@@ -39,7 +39,8 @@
     "hive": "node cli/bin/hive.js",
     "typecheck": "tsc --noEmit -p tsconfig.cli.json",
     "lint": "eslint \"cli/src/**/*.{ts,tsx}\" \"src/**/*.{ts,tsx}\"",
-    "test": "tsx cli/src/tui/commands.test.ts && tsx cli/src/tui/mouse.test.ts && tsx cli/src/services/conversation.test.ts && tsx cli/src/services/permissions.test.ts && tsx src/main/providers/codex-acp.test.ts && tsx cli/src/tui/render.test.ts",
+    "test": "tsx cli/src/tui/commands.test.ts && tsx cli/src/tui/mouse.test.ts && tsx cli/src/services/conversation.test.ts && tsx cli/src/services/permissions.test.ts && tsx src/main/providers/codex-acp.test.ts && tsx src/main/providers/adapters.test.ts && tsx src/main/mcp/dero-packaged.test.ts && tsx cli/src/tui/render.test.ts",
+    "test:package": "node scripts/package-acceptance.mjs",
     "setup:simulator": "node scripts/setup-simulator.mjs"
   },
   "dependencies": {

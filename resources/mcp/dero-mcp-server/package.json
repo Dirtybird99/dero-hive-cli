@@ -2,7 +2,7 @@
   "name": "dero-mcp-server",
   "mcpName": "io.github.DHEBP/dero-mcp-server",
   "version": "0.4.8",
-  "description": "Model Context Protocol (MCP) server exposing DERO Stargate daemon JSON-RPC and bundled documentation to MCP clients. Vendored copy: builds automatically via scripts/setup-mcp.mjs on `npm install` in DERO Hive.",
+  "description": "Model Context Protocol (MCP) server exposing DERO Stargate daemon JSON-RPC and bundled documentation to MCP clients. Vendored copy: bundled by `npm run build:mcp` in DERO Hive CLI.",
   "type": "module",
   "license": "MIT",
   "private": true,
@@ -53,6 +53,6 @@
   "vendoredFrom": {
     "url": "https://github.com/DHEBP/dero-mcp-server",
     "version": "0.4.8",
-    "note": "Vendored as a hardcoded dependency of DERO Hive. To update, refresh this directory from upstream and rerun npm run setup:mcp."
+    "note": "Vendored as a hardcoded dependency of DERO Hive CLI. To update, refresh this directory from upstream and rerun npm run build:mcp."
   }
 }

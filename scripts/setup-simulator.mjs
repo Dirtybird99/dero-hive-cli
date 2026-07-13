@@ -2,7 +2,7 @@
 // Builds the DERO blockchain simulator (cmd/simulator from DEROFDN/derohe)
 // into resources/simulator/bin/ so the in-app simulator toggle can run it.
 // Requires a Go toolchain; skips gracefully when Go or git is unavailable.
-// Runs automatically on `npm install` (postinstall) and is idempotent.
+// Run manually with `npm run setup:simulator`; the build is idempotent.
 
 import { existsSync, mkdirSync, rmSync, readdirSync, createWriteStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';

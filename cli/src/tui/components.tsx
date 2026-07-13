@@ -2,9 +2,9 @@ import React, { Fragment, useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import type { DOMElement } from 'ink';
 import type { Message, ThinkingEffort, TokenUsage } from '../../../src/shared/types.js';
+import { APP_VERSION } from '../../../src/shared/version.js';
 import type { ResolvedTerminalTheme } from './themes.js';
 import { SgrMouseParser } from './mouse.js';
-import packageJson from '../../package.json';
 
 export interface PickerItem {
   id: string;
@@ -224,7 +224,7 @@ export function Welcome({ theme, width, workspace, model, selected = 0, actionRe
     const lineWidth = Math.max(8, width - 8);
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={theme.palette.border} marginTop={1} paddingX={1}>
-        <Text><Text color={theme.palette.foreground} bold>DERO Hive</Text><Text color={theme.palette.subtle}>  {packageJson.version}</Text></Text>
+        <Text><Text color={theme.palette.foreground} bold>DERO Hive</Text><Text color={theme.palette.subtle}>  {APP_VERSION}</Text></Text>
         <Text color={theme.palette.accent} bold>{shorten(model || 'Provider setup required', lineWidth)}</Text>
         <Text color={theme.palette.muted}>{shorten(model ? workspaceName : 'hive provider add', lineWidth)}</Text>
         <Box flexDirection="column" marginTop={1}>
@@ -251,7 +251,7 @@ export function Welcome({ theme, width, workspace, model, selected = 0, actionRe
         </Box>
       )}
       <Box flexDirection="column" flexGrow={1}>
-        <Text><Text color={theme.palette.foreground} bold>DERO Hive</Text><Text color={theme.palette.subtle}>  {packageJson.version}</Text></Text>
+        <Text><Text color={theme.palette.foreground} bold>DERO Hive</Text><Text color={theme.palette.subtle}>  {APP_VERSION}</Text></Text>
         <Box marginTop={1}>
           <Text color={theme.palette.accent} bold>{model ? shorten(model, 38) : 'Provider setup required'}</Text>
         </Box>

@@ -2,6 +2,7 @@ import type { ProviderAdapter, ProviderStreamRequest, ProviderStreamEvent } from
 import { parseSSE } from './streaming';
 import type { ProviderConfig, Message, ToolDefinition, ContentPart } from '@shared/types';
 import { supportsOpenAIReasoningEffort } from '@shared/thinkingCapabilities';
+import { APP_VERSION } from '@shared/version';
 import { logger } from '../utils/logger';
 
 // Kimi Code's docs explicitly require tools to identify themselves via the
@@ -11,7 +12,7 @@ import { logger } from '../utils/logger';
 // benefits." We send our own identifier to every OpenAI-compatible request
 // so Kimi — and any other gateway that audits User-Agent — sees a real
 // client, not the default `Node.js` string from undici.
-const USER_AGENT = `DERO-Hive/${process.env.npm_package_version || '0.1.0'}`;
+const USER_AGENT = `DERO-Hive/${APP_VERSION}`;
 
 // Pull the human-readable message out of an error response body.
 // Handles OpenAI ({error:{message}}) and OpenCode ({type:'error',error:{message}}) shapes.

@@ -1,6 +1,6 @@
 # DERO Hive CLI
 
-DERO Hive CLI is a terminal-native AI coding workspace with multiple model providers, approval controls, project-aware tools, DERO development skills, and Model Context Protocol (MCP) support.
+DERO Hive CLI is a beta terminal-native AI coding workspace with multiple model providers, approval controls, project-aware tools, DERO development skills, and Model Context Protocol (MCP) support.
 
 ## System requirements
 
@@ -15,16 +15,25 @@ DERO Hive CLI is a terminal-native AI coding workspace with multiple model provi
 Install directly from GitHub:
 
 ```bash
-npm install -g https://github.com/Dirtybird99/dero-hive-cli/archive/refs/heads/main.tar.gz --allow-remote=all --allow-scripts=better-sqlite3
+npm install -g https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz --allow-remote=all --allow-scripts=better-sqlite3
 ```
 
-`--allow-remote=all` permits this command to fetch the specified GitHub archive. The narrow `--allow-scripts` list permits only SQLite's native binding build. Hive and its DERO MCP server ship as prebuilt JavaScript bundles and run no install scripts. Do not use `sudo npm install -g`. If npm reports a permissions error, configure a user-owned global npm directory instead.
+`--allow-remote=all` permits this command to fetch the specified GitHub release artifact. The narrow `--allow-scripts` list permits only SQLite's native binding build. Hive and its DERO MCP server ship as prebuilt JavaScript bundles and run no install scripts. Do not use `sudo npm install -g`. If npm reports a permissions error, configure a user-owned global npm directory instead.
+
+To pin this release, replace the URL with:
+
+```text
+https://github.com/Dirtybird99/dero-hive-cli/releases/download/v0.1.0/dero-hive-cli.tgz
+```
+
+The release also publishes `SHA256SUMS` for manual artifact verification.
 
 ### Verify the installation
 
 ```bash
 hive --version
 hive status
+hive doctor
 ```
 
 If `hive` is not found, restart the terminal and confirm npm's global binary directory is on `PATH`:
@@ -74,7 +83,7 @@ The server checks `127.0.0.1:10102` first. If no local DERO daemon is available,
 Reinstall from the GitHub repository to get the current version:
 
 ```bash
-npm install -g https://github.com/Dirtybird99/dero-hive-cli/archive/refs/heads/main.tar.gz --allow-remote=all --allow-scripts=better-sqlite3
+npm install -g https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz --allow-remote=all --allow-scripts=better-sqlite3
 ```
 
 DERO Hive CLI does not update itself in the background.
@@ -116,7 +125,7 @@ Install Node.js 22 or later, then reinstall DERO Hive CLI.
 `better-sqlite3` normally installs a prebuilt binary. If it does not load, reinstall with the approved scripts and a supported Node.js release:
 
 ```bash
-npm install -g https://github.com/Dirtybird99/dero-hive-cli/archive/refs/heads/main.tar.gz --allow-remote=all --allow-scripts=better-sqlite3
+npm install -g https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz --allow-remote=all --allow-scripts=better-sqlite3
 ```
 
 ### DERO MCP server unavailable
@@ -168,8 +177,11 @@ npm run build
 
 - Hive stores its local database, settings, logs, and secrets under `~/.hive` unless overridden.
 - Headless secret storage is machine-derived obfuscation, not an operating-system keychain. Protect the data directory accordingly.
+- Provider keys may be supplied without persistence through `HIVE_PROVIDER_<ID>_API_KEY`, using an uppercase provider id with non-alphanumeric characters replaced by underscores.
 - Do not place API keys, wallet seeds, private keys, or personal configuration in a project repository.
 - Tool and MCP actions remain subject to Hive's approval controls.
+
+Report vulnerabilities through the repository's private vulnerability-reporting form described in [SECURITY.md](SECURITY.md).
 
 ## License and credits
 

@@ -9,7 +9,7 @@ import { getSecret, setSecret, deleteSecret } from '../utils/secrets';
 import type { MediaProviderConfig, MediaArtifactRecord, MediaJobRecord, MediaGenerationRequest, MediaJobStatusEvent, MediaProviderPreset, MediaModelOption, MediaKind } from '@shared/types';
 import { MEDIA_PROVIDER_PRESETS, findMediaPreset } from '@shared/media';
 import { adapterFor, type MediaAdapter } from './adapters';
-import { getProviderConfig } from '../providers/registry';
+import { getProviderApiKey, getProviderConfig } from '../providers/registry';
 
 export type MediaEventHandler = (evt: MediaJobStatusEvent) => void;
 
@@ -231,7 +231,7 @@ export class MediaManager {
       if (!isMinimax && kind === 'video') {
         throw new Error('Video generation is not available through this chat provider. Use a dedicated media provider (Replicate, ComfyUI…) in Settings → Media.');
       }
-      const apiKey = getSecret(`provider:${mp.id}`) || '';
+      const apiKey = getProviderApiKey(mp.id) || '';
       const presetId = isMinimax ? 'minimax-media' : kind === 'audio' ? 'openai-tts' : 'openai-compatible';
       const cfg: MediaProviderConfig = {
         id: `model:${mp.id}`,

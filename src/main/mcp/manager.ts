@@ -3,6 +3,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { EventEmitter } from 'node:events';
 import type { McpServerConfig, McpServerStatus, ToolDefinition } from '@shared/types';
+import { APP_VERSION } from '@shared/version';
 import { getDb } from '../db/client';
 import { logger } from '../utils/logger';
 import { resourcesRoot } from '../utils/paths';
@@ -319,7 +320,7 @@ export class McpManager extends EventEmitter {
         });
 
     const client = new Client(
-      { name: 'dero-hive', version: '0.1.0' },
+      { name: 'dero-hive', version: APP_VERSION },
       { capabilities: {} }
     );
 

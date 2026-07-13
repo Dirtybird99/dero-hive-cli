@@ -15,6 +15,7 @@ import { listProviders } from '../../../src/main/providers/registry.js';
 import { paths, getDefaultWorkspace } from '../../../src/main/utils/paths.js';
 import { getDb } from '../../../src/main/db/client.js';
 import type { Message, TokenUsage } from '../../../src/shared/types.js';
+import { APP_VERSION } from '../../../src/shared/version.js';
 import { loadBundledSkills, loadUserSkills } from '../../../src/main/skills/loader.js';
 
 // ── Command registry ──────────────────────────────────────────────────
@@ -1005,12 +1006,7 @@ async function handleSlashCommand(
     }
 
     case 'release-notes': {
-      try {
-        const pkg = JSON.parse(readFileSync(path.join(paths.userData, '..', 'package.json'), 'utf-8'));
-        console.log(`Hive CLI v${pkg.version}`);
-      } catch {
-        console.log('Hive CLI v0.1.0');
-      }
+      console.log(`Hive CLI v${APP_VERSION}`);
       console.log('Type /help for available commands.');
       break;
     }
