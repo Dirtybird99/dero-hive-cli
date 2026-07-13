@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { mkdir, rm } from 'node:fs/promises';
+import { chmod, mkdir, rm } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -22,3 +22,5 @@ await build({
   sourcemap: false,
   logLevel: 'info'
 });
+
+await chmod(resolve(server, 'dist', 'index.js'), 0o644);
