@@ -53,9 +53,11 @@ const animatedLogo = render(React.createElement(Welcome, {
   width: 100,
   workspace: resolve('.'),
   selected: 0
-}), { stdout: animationStdout, stdin, patchConsole: false });
+}), { stdout: animationStdout, stdin, debug: true, patchConsole: false });
 const animatedLogoExited = animatedLogo.waitUntilExit();
-await new Promise((resolveWait) => setTimeout(resolveWait, 900));
+for (let attempt = 0; attempt < 100 && !/✦/.test(animationOutput); attempt += 1) {
+  await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+}
 assert.match(animationOutput, /✦/, 'the live Hive mark should emit a moving glimmer head');
 animatedLogo.unmount();
 await animatedLogoExited;
