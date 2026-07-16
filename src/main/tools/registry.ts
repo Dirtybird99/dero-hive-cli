@@ -10,6 +10,12 @@ import { reviewXswdTransfer, reviewXswdScInvoke, type XswdTransferParams, type X
 export interface ToolContext {
   cwd: string;
   conversationId: string;
+  /**
+   * Optional cancellation signal. When aborted, long-running executors
+   * (currently run_shell) stop promptly and return a `[cancelled]` error
+   * result. Omitting it preserves the previous, non-cancellable behavior.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ToolResult {

@@ -711,17 +711,29 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
     const { command, cwd, timeout_ms } = args as { command: string; cwd?: string; timeout_ms?: number };
     const base = cwd ? safeResolve(cwd, ctx.cwd) : ctx.cwd;
     const timeout = timeout_ms || 30_000;
+    // An already-cancelled request never spawns a process at all.
+    if (ctx.signal?.aborted) {
+      return { content: '[cancelled] Command was cancelled before it started.', isError: true };
+    }
     try {
       const { stdout, stderr } = await execAsync(command, {
         cwd: base,
         timeout,
         maxBuffer: 10 * 1024 * 1024,
-        shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh'
+        shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh',
+        // exec kills the child itself when the signal aborts, so no manual
+        // abort listener is needed and nothing outlives the tool call.
+        signal: ctx.signal
       });
       const out = (stdout + (stderr ? `\n[stderr]\n${stderr}` : '')).trim();
       return { content: out.slice(0, 50_000) || '(no output)' };
     } catch (err) {
       const e = err as { stdout?: string; stderr?: string; message?: string };
+      // Abort mid-run: exec has already killed the child; surface a
+      // cancellation result (with any captured output) instead of an exit code.
+      if (ctx.signal?.aborted) {
+        return { content: `[cancelled]\n${e.stdout || ''}${e.stderr ? '\n[stderr]\n' + e.stderr : ''}`.trim(), isError: true };
+      }
       return { content: `[exit ${(err as { code?: number }).code ?? 'err'}]\n${e.stdout || ''}${e.stderr ? '\n[stderr]\n' + e.stderr : ''}\n${e.message || ''}`, isError: true };
     }
   },

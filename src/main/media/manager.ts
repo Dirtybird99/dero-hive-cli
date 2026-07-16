@@ -313,6 +313,14 @@ export class MediaManager {
         // the generated media type; we store that exact basename below.
         { outputDir: dirname(join(baseDir, record.relativePath!)), apiKey, cfg }
       );
+      if (this.isCancelled(id)) {
+        // cancel() flipped the row while the provider was still working. Keep
+        // the row cancelled: drop the orphaned file instead of recording the
+        // artifact, and report the cancelled state to the caller.
+        try { await unlink(res.absolutePath); } catch { /* ignore */ }
+        this.cancellations.delete(id);
+        return this.toPublic({ ...record, status: 'cancelled', error: 'Cancelled by user', finishedAt: Date.now() });
+      }
       if (res.bytes > MAX_ARTIFACT_BYTES) {
         // Remove the file we just wrote, then surface a friendly error.
         try { const { unlink: ul } = await import('node:fs/promises'); await ul(res.absolutePath); } catch { /* ignore */ }
@@ -340,11 +348,15 @@ export class MediaManager {
       return pub;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      getDb().prepare('UPDATE media_artifacts SET status = ?, error = ?, finished_at = ? WHERE id = ?')
-        .run('failed', msg, Date.now(), id);
       this.cancellations.delete(id);
-      const pub = this.toPublic({ ...record, status: 'failed', error: msg, finishedAt: Date.now() });
-      this.emit({ job: pub });
+      // A row already flipped to 'cancelled' by cancel() must stay cancelled —
+      // do not overwrite it with 'failed'.
+      if (!this.isCancelled(id)) {
+        getDb().prepare('UPDATE media_artifacts SET status = ?, error = ?, finished_at = ? WHERE id = ?')
+          .run('failed', msg, Date.now(), id);
+        const pub = this.toPublic({ ...record, status: 'failed', error: msg, finishedAt: Date.now() });
+        this.emit({ job: pub });
+      }
       throw err;
     }
   }
@@ -356,6 +368,12 @@ export class MediaManager {
     getDb().prepare('UPDATE media_artifacts SET status = ?, error = ?, finished_at = ? WHERE id = ?')
       .run('cancelled', 'Cancelled by user', Date.now(), id);
     return true;
+  }
+
+  /** True when cancel() already flipped this job's row to 'cancelled'. */
+  private isCancelled(id: string): boolean {
+    const row = getDb().prepare('SELECT status FROM media_artifacts WHERE id = ?').get(id) as { status?: string } | undefined;
+    return row?.status === 'cancelled';
   }
 
   // ── File operations for the renderer ─────────────────────────────────────

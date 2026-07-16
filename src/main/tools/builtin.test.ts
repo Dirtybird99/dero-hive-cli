@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BUILTIN_TOOLS, builtinExecutors } from './builtin.js';
@@ -34,8 +34,136 @@ try {
   assert.match((await builtinExecutors.grep_files({ pattern: 'gamma', include: '**/*.txt' }, ctx)).content, /example\.txt:2:gamma/u);
   await assert.rejects(() => builtinExecutors.read_file({ path: '../outside.txt' }, ctx), /outside allowed workspace/u);
 
+  // read_file: missing target reports an error result rather than throwing.
+  const missingRead = await builtinExecutors.read_file({ path: 'does-not-exist.txt' }, ctx);
+  assert.equal(missingRead.isError, true);
+  assert.match(missingRead.content, /file not found/u);
+
+  // edit_file: a non-unique old_text is rejected (must match exactly once).
+  await builtinExecutors.write_file({ path: 'dup.txt', content: 'dup\ndup\n' }, ctx);
+  const dupEdit = await builtinExecutors.edit_file({ path: 'dup.txt', old_text: 'dup', new_text: 'z' }, ctx);
+  assert.equal(dupEdit.isError, true);
+  assert.match(dupEdit.content, /matches 2 locations/u);
+  // The rejected edit leaves the file untouched.
+  assert.equal(readFileSync(join(root, 'dup.txt'), 'utf8'), 'dup\ndup\n');
+
+  // Path-boundary rejection for write/edit/list — tools not covered above.
+  await assert.rejects(() => builtinExecutors.write_file({ path: '../escape.txt', content: 'x' }, ctx), /outside allowed workspace/u);
+  await assert.rejects(() => builtinExecutors.edit_file({ path: '../escape.txt', old_text: 'a', new_text: 'b' }, ctx), /outside allowed workspace/u);
+  await assert.rejects(() => builtinExecutors.list_directory({ path: '../sneaky' }, ctx), /outside allowed workspace/u);
+
   result = await builtinExecutors.run_shell({ command: 'node -e "process.stdout.write(\'shell-ok\')"' }, ctx);
   assert.equal(result.content, 'shell-ok');
+
+  // ---- run_shell: long-running process kill, exit codes, stderr, invalid input ----
+  // run_shell has two kill paths for a long-running external process:
+  // timeout_ms (pinned down here) and the optional ctx.signal AbortSignal
+  // (pinned down in the cancellation section below).
+
+  // timeout_ms terminates a long-running process promptly. The shell itself is
+  // the sleeper (Start-Sleep / sleep are shell-level), so the killed process is
+  // exactly the one exec spawned and nothing is orphaned. The tool must settle
+  // far sooner than the 10s sleep and report the kill (exit code null -> 'err')
+  // as an error result. If the child were not reaped, this test file itself
+  // would hang past the sleep instead of exiting promptly.
+  const sleepCommand = process.platform === 'win32' ? 'Start-Sleep -Seconds 10' : 'sleep 10';
+  const timeoutStart = Date.now();
+  const timedOut = await builtinExecutors.run_shell({ command: sleepCommand, timeout_ms: 1_000 }, ctx);
+  const timeoutElapsed = Date.now() - timeoutStart;
+  assert.equal(timedOut.isError, true);
+  assert.match(timedOut.content, /^\[exit err\]/u);
+  assert.ok(timeoutElapsed < 8_000, `timed-out run_shell settled in ${timeoutElapsed}ms; expected well under the 10s sleep`);
+
+  // ---- run_shell: AbortSignal cancellation (ctx.signal) ----
+
+  // An already-aborted signal settles immediately with the pre-spawn
+  // cancellation result: no process is spawned, so the marker file the
+  // command would have written must never appear.
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const preStart = Date.now();
+  const preCancelled = await builtinExecutors.run_shell(
+    { command: 'node -e "require(\'fs\').writeFileSync(\'abort-marker.txt\', \'ran\')"' },
+    { ...ctx, signal: preAborted.signal }
+  );
+  assert.equal(preCancelled.isError, true);
+  assert.match(preCancelled.content, /^\[cancelled\]/u);
+  assert.match(preCancelled.content, /before it started/u);
+  assert.ok(Date.now() - preStart < 2_000, 'pre-aborted run_shell must settle without running the command');
+  assert.equal(existsSync(join(root, 'abort-marker.txt')), false);
+
+  // Abort mid-run: exec kills the child promptly and the tool reports a
+  // cancellation result long before the 10s sleep would finish. On win32 the
+  // shell itself sleeps (same orphan-avoidance reasoning as the timeout test
+  // above) so the killed pid is exactly the one exec spawned; on POSIX
+  // /bin/sh execs the single node command, so the kill reaps node itself.
+  // If the child were not reaped, this test file would hang past the sleep.
+  const cancelSleepCommand = process.platform === 'win32'
+    ? 'Start-Sleep -Seconds 10'
+    : 'node -e "setTimeout(()=>{},10000)"';
+  const midAbort = new AbortController();
+  setTimeout(() => midAbort.abort(), 50);
+  const midStart = Date.now();
+  const midCancelled = await builtinExecutors.run_shell(
+    { command: cancelSleepCommand },
+    { ...ctx, signal: midAbort.signal }
+  );
+  const midElapsed = Date.now() - midStart;
+  assert.equal(midCancelled.isError, true);
+  assert.match(midCancelled.content, /^\[cancelled\]/u);
+  assert.ok(midElapsed < 8_000, `aborted run_shell settled in ${midElapsed}ms; expected well under the 10s sleep`);
+
+  // A fresh, never-aborted signal changes nothing: success output is
+  // identical to a signal-less run...
+  const freshSignal = new AbortController().signal;
+  const freshOk = await builtinExecutors.run_shell(
+    { command: 'node -e "process.stdout.write(\'signal-ok\')"' },
+    { ...ctx, signal: freshSignal }
+  );
+  assert.equal(freshOk.isError, undefined);
+  assert.equal(freshOk.content, 'signal-ok');
+
+  // ...and timeout_ms still kills a long runner exactly as it does without one.
+  const freshTimeoutStart = Date.now();
+  const freshTimedOut = await builtinExecutors.run_shell({ command: sleepCommand, timeout_ms: 1_000 }, { ...ctx, signal: freshSignal });
+  assert.equal(freshTimedOut.isError, true);
+  assert.match(freshTimedOut.content, /^\[exit err\]/u);
+  assert.ok(Date.now() - freshTimeoutStart < 8_000, 'timeout with a fresh, never-aborted signal must still settle promptly');
+
+  // Shell-level exit codes are captured verbatim ('exit 3' is valid in both
+  // PowerShell and /bin/sh; a child process's nonzero exit is remapped by
+  // PowerShell on Windows, so the shell-level form is the portable assertion).
+  const exitCode = await builtinExecutors.run_shell({ command: 'exit 3' }, ctx);
+  assert.equal(exitCode.isError, true);
+  assert.match(exitCode.content, /^\[exit 3\]/u);
+
+  // stderr is captured alongside stdout on success, stdout first.
+  const withStderr = await builtinExecutors.run_shell({ command: 'node -e "console.error(\'warn-line\'); process.stdout.write(\'out-line\')"' }, ctx);
+  assert.equal(withStderr.isError, undefined);
+  assert.match(withStderr.content, /out-line[\s\S]*\[stderr\][\s\S]*warn-line/u);
+
+  // stderr is also surfaced on failure (the exact code differs per shell:
+  // PowerShell remaps a child's nonzero exit to 1, /bin/sh passes it through).
+  const failStderr = await builtinExecutors.run_shell({ command: 'node -e "console.error(\'boom-detail\'); process.exit(2)"' }, ctx);
+  assert.equal(failStderr.isError, true);
+  assert.match(failStderr.content, /^\[exit \d+\]/u);
+  assert.match(failStderr.content, /\[stderr\][\s\S]*boom-detail/u);
+
+  // Missing command: no process is spawned and the invalid input comes back as
+  // an error result (ERR_INVALID_ARG_TYPE), not a thrown exception.
+  const noCommand = await builtinExecutors.run_shell({}, ctx);
+  assert.equal(noCommand.isError, true);
+  assert.match(noCommand.content, /must be of type string/u);
+
+  // A cwd escaping the workspace is rejected by path policy before any spawn.
+  await assert.rejects(() => builtinExecutors.run_shell({ command: 'exit 0', cwd: '../outside' }, ctx), /outside allowed workspace/u);
+
+  // Captured output is capped at 50 KB; a silent command reports '(no output)'.
+  const bigOut = await builtinExecutors.run_shell({ command: 'node -e "process.stdout.write(\'x\'.repeat(60000))"' }, ctx);
+  assert.equal(bigOut.isError, undefined);
+  assert.equal(bigOut.content.length, 50_000);
+  assert.equal((await builtinExecutors.run_shell({ command: 'node -e "0"' }, ctx)).content, '(no output)');
+
   assert.match((await builtinExecutors.todo_write({ todos: [{ content: 'ship', status: 'completed' }] }, ctx)).content, /\[x\] ship/u);
 
   const contract = 'Function Initialize() Uint64\n10 STORE("owner", SIGNER())\n20 RETURN 0\nEnd Function';
@@ -44,14 +172,67 @@ try {
   assert.match((await builtinExecutors.audit_dvm_contract({ source: contract, contractName: 'Vault' }, ctx)).content, /Security Audit/u);
   assert.match((await builtinExecutors.discover_contracts({ query: 'vault', kind: 'by-function' }, ctx)).content, /vault/u);
 
+  // lint_dvm_basic: non-string source and oversized source are both rejected.
+  const lintNonString = await builtinExecutors.lint_dvm_basic({ source: 12345 }, ctx);
+  assert.equal(lintNonString.isError, true);
+  assert.match(lintNonString.content, /must be a string/u);
+  const lintOversized = await builtinExecutors.lint_dvm_basic({ source: 'x'.repeat(250_001) }, ctx);
+  assert.equal(lintOversized.isError, true);
+  assert.match(lintOversized.content, /250 KB analysis limit/u);
+
+  // generate_dvm_contract: both name and brief are required.
+  const dvmMissingBrief = await builtinExecutors.generate_dvm_contract({ name: 'Vault' }, ctx);
+  assert.equal(dvmMissingBrief.isError, true);
+  assert.match(dvmMissingBrief.content, /required/u);
+  assert.equal((await builtinExecutors.generate_dvm_contract({ brief: 'no name given' }, ctx)).isError, true);
+  assert.equal((await builtinExecutors.generate_dvm_contract({}, ctx)).isError, true);
+
+  // audit_dvm_contract: whitespace-only source is treated as empty and rejected.
+  const auditEmpty = await builtinExecutors.audit_dvm_contract({ source: '   ' }, ctx);
+  assert.equal(auditEmpty.isError, true);
+  assert.match(auditEmpty.content, /source is required/u);
+
   result = await builtinExecutors.generate_tela_dapp({ name: 'ToolTest', description: 'test dApp' }, ctx);
   assert.equal(result.isError, undefined);
   assert.match(readFileSync(join(root, 'tela', 'ToolTest', 'tela.config.json'), 'utf8'), /ToolTest/u);
+
+  // generate_tela_dapp: a whitespace-only name is rejected before any file is written.
+  const telaEmpty = await builtinExecutors.generate_tela_dapp({ name: '   ', description: 'x' }, ctx);
+  assert.equal(telaEmpty.isError, true);
+  assert.match(telaEmpty.content, /name is required/u);
 
   globalThis.fetch = async () => new Response(JSON.stringify({ result: {
     network: 'simulator', height: 12, topoheight: 11, tx_pool_size: 0, status: 'OK', version: 'test'
   } }), { status: 200, headers: { 'content-type': 'application/json' } });
   assert.match((await builtinExecutors.get_simulator_chain_info({}, ctx)).content, /simulator/u);
+
+  // get_simulator_chain_info: RPC error body, non-OK HTTP, and transport failure.
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'sim boom' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  const infoErr = await builtinExecutors.get_simulator_chain_info({}, ctx);
+  assert.equal(infoErr.isError, true);
+  assert.match(infoErr.content, /sim boom/u);
+  globalThis.fetch = async () => new Response('{}', { status: 500, headers: { 'content-type': 'application/json' } });
+  const infoHttp = await builtinExecutors.get_simulator_chain_info({}, ctx);
+  assert.equal(infoHttp.isError, true);
+  assert.match(infoHttp.content, /HTTP 500/u);
+  globalThis.fetch = async () => { throw new Error('ECONNREFUSED'); };
+  const infoThrow = await builtinExecutors.get_simulator_chain_info({}, ctx);
+  assert.equal(infoThrow.isError, true);
+  assert.match(infoThrow.content, /simulator unavailable/u);
+
+  // Simulator tools with no manager registered (default null state) report unavailable.
+  const noMgrWallet = await builtinExecutors.simulator_create_wallet({}, ctx);
+  assert.equal(noMgrWallet.isError, true);
+  assert.match(noMgrWallet.content, /not available/u);
+  const noMgrBalance = await builtinExecutors.simulator_get_balance({ address: 'dero1x' }, ctx);
+  assert.equal(noMgrBalance.isError, true);
+  assert.match(noMgrBalance.content, /not available/u);
+  const noMgrState = await builtinExecutors.simulator_get_contract_state({ scid: '0'.repeat(64) }, ctx);
+  assert.equal(noMgrState.isError, true);
+  assert.match(noMgrState.content, /not available/u);
+  const noMgrHeight = await builtinExecutors.simulator_get_height({}, ctx);
+  assert.equal(noMgrHeight.isError, true);
+  assert.match(noMgrHeight.content, /not available/u);
 
   setSimulatorManager({
     async createFixtureWallet() { return { address: 'dero1test', scid: '0'.repeat(64) }; },
@@ -63,6 +244,25 @@ try {
   assert.match((await builtinExecutors.simulator_get_balance({ address: 'dero1test' }, ctx)).content, /42/u);
   assert.match((await builtinExecutors.simulator_get_contract_state({ scid: '0'.repeat(64), keys: 'owner' }, ctx)).content, /owner/u);
   assert.match((await builtinExecutors.simulator_get_height({}, ctx)).content, /12/u);
+
+  // With a manager present, missing required fields are rejected past the mgr guard.
+  const balNoAddr = await builtinExecutors.simulator_get_balance({}, ctx);
+  assert.equal(balNoAddr.isError, true);
+  assert.match(balNoAddr.content, /address is required/u);
+  const stateNoScid = await builtinExecutors.simulator_get_contract_state({}, ctx);
+  assert.equal(stateNoScid.isError, true);
+  assert.match(stateNoScid.content, /scid is required/u);
+
+  // Media manager is still null here: a real prompt hits the unavailable branch,
+  // while an empty prompt/text is rejected before the manager is ever consulted.
+  const mediaNoMgr = await builtinExecutors.generate_image({ prompt: 'hive' }, ctx);
+  assert.equal(mediaNoMgr.isError, true);
+  assert.match(mediaNoMgr.content, /unavailable in this session/u);
+  const imgEmpty = await builtinExecutors.generate_image({ prompt: '' }, ctx);
+  assert.equal(imgEmpty.isError, true);
+  assert.match(imgEmpty.content, /non-empty prompt/u);
+  assert.equal((await builtinExecutors.generate_audio({ text: '   ' }, ctx)).isError, true);
+  assert.equal((await builtinExecutors.generate_video({ prompt: '' }, ctx)).isError, true);
 
   // dero_wallet_* — offline path first (no XSWD manager registered): every
   // executor must fail closed with the connect hint, never throw.
@@ -111,6 +311,26 @@ try {
   assert.match((await builtinExecutors.generate_image({ prompt: 'hive', aspect: 'landscape' }, ctx)).content, /saved/u);
   assert.match((await builtinExecutors.generate_audio({ text: 'hello', voice: 'alloy' }, ctx)).content, /saved/u);
   assert.match((await builtinExecutors.generate_video({ prompt: 'chain', duration_seconds: 5 }, ctx)).content, /saved/u);
+
+  // No provider can service the request: autoPick returns null -> setup hint.
+  setMediaManager({
+    autoPick() { return null; },
+    async generate() { throw new Error('should not be reached'); },
+    async copyArtifactToProject() { return { ok: false }; }
+  } as never);
+  const noPick = await builtinExecutors.generate_image({ prompt: 'hive' }, ctx);
+  assert.equal(noPick.isError, true);
+  assert.match(noPick.content, /No image generator is configured/u);
+
+  // Provider throws during generation -> failure is surfaced, not thrown.
+  setMediaManager({
+    autoPick(kind: string) { return { providerId: 'fake', model: `fake-${kind}` }; },
+    async generate() { throw new Error('provider exploded'); },
+    async copyArtifactToProject() { return { ok: false }; }
+  } as never);
+  const genThrow = await builtinExecutors.generate_audio({ text: 'hello' }, ctx);
+  assert.equal(genThrow.isError, true);
+  assert.match(genThrow.content, /Media generation failed/u);
 } finally {
   globalThis.fetch = originalFetch;
   setMediaManager(null);

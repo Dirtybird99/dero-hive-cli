@@ -46,7 +46,10 @@ export async function* parseSSE(
   const abortHandler = (): void => {
     error = new Error('Aborted');
     done = true;
-    try { void reader.cancel(); } catch { /* ignore */ }
+    // Fire-and-forget: cancel() rejects when the fetch layer has already
+    // errored the stream, so swallow the rejection to keep it from escaping
+    // as an unhandled rejection.
+    try { reader.cancel().catch(() => { /* ignore */ }); } catch { /* ignore */ }
     wake();
   };
   if (signal) {

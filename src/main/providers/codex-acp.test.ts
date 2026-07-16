@@ -42,4 +42,48 @@ try {
   await adapter.dispose();
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle: pre-aborted signals, disposal semantics, and double-dispose.
+// ---------------------------------------------------------------------------
+const lifecycle = new CodexAcpAdapter(config);
+try {
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const never = lifecycle.stream({
+    conversationId: 'pre-aborted', cwd: process.cwd(), model: 'fake-model',
+    messages: [message('never', 'must not be sent')], signal: preAborted.signal
+  });
+  await assert.rejects(
+    never.next(),
+    (error: unknown) => (error as { name?: string }).name === 'AbortError'
+      && /cancelled/iu.test((error as Error).message),
+    'a signal aborted before the prompt is sent must cancel without prompting'
+  );
+  await lifecycle.closeConversation('never-existed'); // unknown conversations are a safe no-op
+} finally {
+  await lifecycle.dispose();
+}
+
+await lifecycle.dispose(); // double-dispose must be safe
+await assert.rejects(
+  lifecycle.stream({
+    conversationId: 'post-dispose', cwd: process.cwd(), model: 'fake-model', messages: [message('post', 'after dispose')]
+  }).next(),
+  /disposed/u,
+  'streaming after dispose must be refused'
+);
+const disposedProbe = await lifecycle.testConnection();
+assert.equal(disposedProbe.ok, false);
+assert.match(disposedProbe.error || '', /disposed/u);
+await lifecycle.closeConversation('post-dispose'); // safe no-op once the runtime is gone
+
+const neverStarted = new CodexAcpAdapter(config);
+await neverStarted.dispose(); // disposing before first use must not spawn or throw
+await assert.rejects(
+  neverStarted.stream({
+    conversationId: 'unused', cwd: process.cwd(), model: 'fake-model', messages: [message('unused', 'never sent')]
+  }).next(),
+  /disposed/u
+);
+
 console.log('codex ACP context tests passed');

@@ -1,5 +1,5 @@
 import { writeFile } from 'node:fs/promises';
-import { join, extname } from 'node:path';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { MediaGenerationRequest, MediaProviderConfig, MediaKind } from '@shared/types';
 
@@ -181,12 +181,18 @@ export class OpenAIImageAdapter implements MediaAdapter {
   }
 }
 
-function mimeToExt(mime: string): string {
-  if (mime.includes('jpeg')) return 'jpg';
-  if (mime.includes('png')) return 'png';
-  if (mime.includes('webp')) return 'webp';
-  if (mime.includes('gif')) return 'gif';
-  return 'png';
+function mimeToExt(mime: string, kind: MediaKind = 'image'): string {
+  const m = mime.toLowerCase();
+  if (m.startsWith('audio/')) return audioExtFromMime(m);
+  if (m.includes('jpeg')) return 'jpg';
+  if (m.includes('png')) return 'png';
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('gif')) return 'gif';
+  if (m.includes('mp4')) return 'mp4';
+  if (m.includes('webm')) return 'webm';
+  if (m.includes('quicktime')) return 'mov';
+  // Unknown mime: fall back per artifact kind rather than always assuming png.
+  return kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : 'png';
 }
 
 function pickOpenAISize(model: string, width: number, height: number): string {
@@ -425,9 +431,7 @@ export class ReplicateAdapter implements MediaAdapter {
     const buf = Buffer.from(arr);
     const defaultMime = this.kind === 'video' ? 'video/mp4' : this.kind === 'audio' ? 'audio/mpeg' : 'image/png';
     const mime = dl.headers.get('content-type') || defaultMime;
-    const ext = this.kind === 'audio'
-      ? audioExtFromMime(mime)
-      : (mimeToExt(mime) || (this.kind === 'video' ? 'mp4' : 'png'));
+    const ext = mimeToExt(mime, this.kind);
     const filename = makeFilename(this.kind, ext);
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
@@ -542,7 +546,7 @@ export class ComfyUIAdapter implements MediaAdapter {
             const arr = new Uint8Array(await dl.arrayBuffer());
             const buf = Buffer.from(arr);
             const mime = dl.headers.get('content-type') || (this.kind === 'video' ? 'image/gif' : 'image/png');
-            const ext = mimeToExt(mime) || extname(media.filename).slice(1) || (this.kind === 'video' ? 'gif' : 'png');
+            const ext = mimeToExt(mime, this.kind);
             const filename = makeFilename(this.kind, ext);
             const abs = join(ctx.outputDir, ctx.filename || filename);
             const relative = ctx.filename || filename;
@@ -976,7 +980,7 @@ export class MinimaxMediaAdapter implements MediaAdapter {
     if (!dl.ok) throw new Error(`MiniMax video download failed: ${dl.status}`);
     const buf = Buffer.from(new Uint8Array(await dl.arrayBuffer()));
     const mime = dl.headers.get('content-type') || 'video/mp4';
-    const { abs, relative } = await this.writeOut(buf, 'video', mimeToExt(mime) || 'mp4', ctx);
+    const { abs, relative } = await this.writeOut(buf, 'video', mimeToExt(mime, 'video'), ctx);
     return { absolutePath: abs, relativePath: relative, mimeType: mime, bytes: buf.length, durationSeconds: duration };
   }
 }

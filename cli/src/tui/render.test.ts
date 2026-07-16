@@ -449,6 +449,289 @@ try {
   seededApp.unmount();
   await seededExited;
 
+  // ── Event-driven provider coverage: form validation, mid-form cancellation,
+  //    connection test, model refresh (success + failure banner), and the
+  //    destructive remove-provider confirmation. Uses a loopback HTTP server so
+  //    no external network or credentials are ever touched.
+  const { createServer } = await import('node:http');
+  const providerService = await import('../../../src/main/providers/service.js');
+  const providerRegistry = await import('../../../src/main/providers/registry.js');
+
+  let fakeModelIds = ['hive-fake-alpha'];
+  let fakeModelsFail = false;
+  const fakeProviderServer = createServer((request, response) => {
+    response.setHeader('content-type', 'application/json');
+    if (!fakeModelsFail && request.method === 'GET' && request.url === '/models') {
+      response.end(JSON.stringify({ data: fakeModelIds.map((id) => ({ id })) }));
+      return;
+    }
+    if (request.method === 'POST' && request.url === '/chat/completions') {
+      response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end(JSON.stringify({ error: { message: 'not found' } }));
+  });
+  await new Promise<void>((resolveListen) => { fakeProviderServer.listen(0, '127.0.0.1', resolveListen); });
+  const fakeAddress = fakeProviderServer.address();
+  if (!fakeAddress || typeof fakeAddress !== 'object') throw new Error('the fake provider server did not report a port');
+  const fakeBaseUrl = `http://127.0.0.1:${fakeAddress.port}`;
+
+  const savedFake = await providerService.saveProvider({
+    id: 'local-fake', presetId: 'custom', name: 'Local Fake', baseUrl: fakeBaseUrl, enabled: true, defaultModel: 'hive-fake-alpha'
+  });
+  assert.equal(savedFake.discovery.ok, true, 'the loopback provider must connect without external network');
+
+  const strippedOutput = (): string => output.replace(ansiCsi, '');
+  const whitespaceTolerant = (text: string): RegExp => new RegExp(
+    text.split(' ').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+')
+  );
+  async function waitForOutput(pattern: RegExp): Promise<void> {
+    for (let attempt = 0; attempt < 150 && !pattern.test(strippedOutput()); attempt += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    assert.match(strippedOutput(), pattern);
+  }
+  async function pressKey(sequence: string, settleMs = 80): Promise<void> {
+    stdin.write(sequence);
+    await new Promise((resolveWait) => setTimeout(resolveWait, settleMs));
+  }
+  async function typeText(text: string): Promise<void> {
+    for (const character of text) stdin.write(character);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+  }
+  async function clearOverlayInput(): Promise<void> {
+    await pressKey('\u0001', 40);
+    await pressKey('\u001b[3~', 60);
+  }
+  async function openProvidersOverlay(): Promise<void> {
+    output = '';
+    await pressKey('\u001bOQ');
+    await waitForOutput(/❯ Providers /);
+    output = '';
+    await pressKey('\r');
+    await waitForOutput(/Connect provider/);
+  }
+  async function openLocalFakeManagement(): Promise<void> {
+    await openProvidersOverlay();
+    output = '';
+    await typeText('local');
+    await waitForOutput(/❯ configured \/ Local Fake/);
+    output = '';
+    await pressKey('\r');
+    await waitForOutput(/Verify credentials and endpoint/);
+  }
+
+  output = '';
+  const providerApp = render(React.createElement(App, { options: { cwd: resolve('.') } }), {
+    stdin, stdout, stderr: process.stderr, exitOnCtrlC: false, debug: true, patchConsole: false
+  });
+  const providerExited = providerApp.waitUntilExit();
+  await waitForOutput(/Local Fake/);
+  await waitForOutput(/hive-fake-alpha/);
+
+  // Provider form validation: required, malformed, and duplicate ids.
+  await openProvidersOverlay();
+  output = '';
+  await typeText('connect');
+  await waitForOutput(/❯ action \/ Connect provider/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/OpenCode Zen/);
+  output = '';
+  await typeText('custom');
+  await waitForOutput(/❯ Custom OpenAI-compatible/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ Provider id Step 1 of 5/);
+  assert.match(strippedOutput(), /Type a value · Enter continue · Esc cancel/);
+  assert.match(strippedOutput(), /⌕ custom/, 'the id step must pre-fill the preset id');
+  await clearOverlayInput();
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/× Provider id is required\./);
+  await typeText('bad id');
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(whitespaceTolerant('× Provider id may contain letters, numbers, dots, dashes, and underscores.'));
+  await clearOverlayInput();
+  await typeText('local-fake');
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(whitespaceTolerant('× Provider id “local-fake” is already configured.'));
+
+  // A valid id advances the wizard; base URL validation then rejects bad input.
+  await clearOverlayInput();
+  await typeText('local-two');
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ Display name Step 2 of 5/);
+  assert.match(strippedOutput(), /⌕ Custom OpenAI-compatible/, 'the name step must pre-fill the preset name');
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ Base URL Step 3 of 5/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/× Base URL is required\./);
+  await typeText('ftp://blocked.invalid');
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(whitespaceTolerant('× Base URL must be http(s) and must not contain credentials.'));
+  await clearOverlayInput();
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/× Base URL is required\./);
+  await typeText('http://user:secret@127.0.0.1:65000');
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(whitespaceTolerant('× Base URL must be http(s) and must not contain credentials.'));
+
+  // Esc mid-form cancels without a partial save and resets the draft.
+  output = '';
+  await pressKey('\u001b', 100);
+  await waitForOutput(/DERO Hive/);
+  assert.equal(providerRegistry.getProviderConfig('local-two'), null, 'cancelling provider setup mid-form must not save a partial provider');
+  assert.equal(providerRegistry.listProviders().length, 1, 'cancelling provider setup must leave the provider list unchanged');
+  await openProvidersOverlay();
+  output = '';
+  await typeText('connect');
+  await waitForOutput(/❯ action \/ Connect provider/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/OpenCode Zen/);
+  output = '';
+  await typeText('custom');
+  await waitForOutput(/❯ Custom OpenAI-compatible/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ Provider id Step 1 of 5/);
+  assert.match(strippedOutput(), /⌕ custom/, 're-opening provider setup must start from a fresh draft');
+  assert.doesNotMatch(strippedOutput(), /local-two/, 'a cancelled draft must not leak into the next setup');
+  await pressKey('\u001b', 100);
+
+  // Test connection succeeds against the loopback endpoint.
+  await openLocalFakeManagement();
+  assert.match(strippedOutput(), /❯ Test connection Verify credentials and endpoint/);
+  assert.match(strippedOutput(), /Refresh models/);
+  assert.match(strippedOutput(), /Add API key Input stays masked/);
+  assert.match(strippedOutput(), /Disable provider/);
+  assert.match(strippedOutput(), /Remove provider Requires confirmation/);
+  output = '';
+  await typeText('test');
+  await waitForOutput(/❯ Test connection/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/Testing Local Fake…/);
+  await waitForOutput(/· Local Fake is reachable\./);
+
+  // Refresh models re-fetches and persists the discovered list.
+  fakeModelIds = ['hive-fake-alpha', 'hive-fake-beta'];
+  await openLocalFakeManagement();
+  output = '';
+  await typeText('refresh');
+  await waitForOutput(/❯ Refresh models/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/Refreshing Local Fake models…/);
+  await waitForOutput(/· Local Fake models refreshed · 2 available\./);
+  assert.deepEqual(
+    providerRegistry.getProviderConfig('local-fake')?.models.map((entry) => entry.id),
+    ['hive-fake-alpha', 'hive-fake-beta'],
+    'refresh must persist the newly discovered model list'
+  );
+
+  // A failing refresh surfaces an error banner and keeps the previous models.
+  fakeModelsFail = true;
+  await openLocalFakeManagement();
+  output = '';
+  await typeText('refresh');
+  await waitForOutput(/❯ Refresh models/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(whitespaceTolerant('× Local Fake refresh failed: Could not retrieve model list from provider'));
+  assert.equal(providerRegistry.getProviderConfig('local-fake')?.models.length, 2, 'a failed refresh must keep the previously discovered models');
+  fakeModelsFail = false;
+
+  // Destructive confirmation: declining keeps the provider, confirming removes it.
+  await openLocalFakeManagement();
+  output = '';
+  await typeText('remove');
+  await waitForOutput(/❯ Remove provider Requires confirmation/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/Confirm provider removal/);
+  assert.match(strippedOutput(), /❯ Remove Local Fake This also removes its saved API key/);
+  assert.match(strippedOutput(), /Cancel Keep this provider/);
+  output = '';
+  await pressKey('\u001b[B');
+  await waitForOutput(/❯ Cancel Keep this provider/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/Verify credentials and endpoint/);
+  assert.ok(providerRegistry.getProviderConfig('local-fake'), 'declining the removal confirmation must keep the provider');
+  output = '';
+  await typeText('remove');
+  await waitForOutput(/❯ Remove provider Requires confirmation/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/Confirm provider removal/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/· Local Fake removed\./);
+  assert.equal(providerRegistry.getProviderConfig('local-fake'), null, 'confirming removal must delete the provider');
+
+  // Completing the whole form: masked key entry, save, and a discovery-failure banner.
+  await openProvidersOverlay();
+  await waitForOutput(/❯ action \/ Connect provider/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/OpenCode Zen/);
+  output = '';
+  await typeText('custom');
+  await waitForOutput(/❯ Custom OpenAI-compatible/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ Provider id Step 1 of 5/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ Display name Step 2 of 5/);
+  await clearOverlayInput();
+  await typeText('Local Broken');
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ Base URL Step 3 of 5/);
+  await typeText(`${fakeBaseUrl}/missing`);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ Default model Step 4 of 5/);
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/× Default model is required\./);
+  await typeText('broken-model');
+  output = '';
+  await pressKey('\r');
+  await waitForOutput(/❯ API key or subscription key/);
+  assert.match(strippedOutput(), /Paste a key, or leave blank if authentication is not req/);
+  assert.match(strippedOutput(), /⌕ optional/, 'the key step must show its optional placeholder');
+  output = '';
+  await typeText('sekret-key-123');
+  await waitForOutput(/•{14}/);
+  assert.doesNotMatch(output, /sekret-key-123/, 'typing a provider key must render only mask characters');
+  await pressKey('\r');
+  await waitForOutput(whitespaceTolerant('Saving Local Broken and discovering models…'));
+  await waitForOutput(whitespaceTolerant('× Local Broken was saved, but model discovery failed: Could not retrieve model list from provider'));
+  assert.doesNotMatch(output, /sekret-key-123/, 'provider save notices must never echo the key');
+  const brokenProvider = providerRegistry.getProviderConfig('custom');
+  assert.ok(brokenProvider, 'completing the form must save the provider even when discovery fails');
+  assert.equal(brokenProvider?.name, 'Local Broken');
+  assert.equal(brokenProvider?.hasApiKey, true, 'the submitted key must be stored for the saved provider');
+  assert.deepEqual(brokenProvider?.models.map((entry) => entry.id), ['broken-model'], 'a failed discovery must fall back to the typed default model');
+
+  providerApp.unmount();
+  await providerExited;
+  fakeProviderServer.closeAllConnections();
+  await new Promise((resolveClose) => { fakeProviderServer.close(() => resolveClose(undefined)); });
+
   const composer = render(React.createElement(ComposerProbe), { stdout, stdin, patchConsole: false });
   const composerExited = composer.waitUntilExit();
   await new Promise((resolveWait) => setTimeout(resolveWait, 40));
