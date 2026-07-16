@@ -5,12 +5,13 @@ import { join } from 'node:path';
 import { BUILTIN_TOOLS, builtinExecutors } from './builtin.js';
 import { setMediaManager } from '../media/instance.js';
 import { setSimulatorManager } from '../simulator/instance.js';
+import { setXswdManager } from '../xswd/instance.js';
 
 const root = mkdtempSync(join(tmpdir(), 'dero-hive-tools-'));
 const ctx = { cwd: root, conversationId: 'tool-test' };
 const originalFetch = globalThis.fetch;
 
-assert.equal(BUILTIN_TOOLS.length, 21);
+assert.equal(BUILTIN_TOOLS.length, 27);
 assert.equal(new Set(BUILTIN_TOOLS.map(({ name }) => name)).size, BUILTIN_TOOLS.length);
 assert.deepEqual(Object.keys(builtinExecutors).sort(), BUILTIN_TOOLS.map(({ name }) => name).sort());
 
@@ -63,6 +64,42 @@ try {
   assert.match((await builtinExecutors.simulator_get_contract_state({ scid: '0'.repeat(64), keys: 'owner' }, ctx)).content, /owner/u);
   assert.match((await builtinExecutors.simulator_get_height({}, ctx)).content, /12/u);
 
+  // dero_wallet_* — offline path first (no XSWD manager registered): every
+  // executor must fail closed with the connect hint, never throw.
+  for (const tool of ['dero_wallet_address', 'dero_wallet_balance', 'dero_wallet_height', 'dero_wallet_history'] as const) {
+    const offline = await builtinExecutors[tool]({}, ctx);
+    assert.equal(offline.isError, true);
+    assert.match(offline.content, /XSWD wallet is not connected/u);
+  }
+  assert.match((await builtinExecutors.dero_wallet_transfer({ destination: 'dero1x', amount: 1 }, ctx)).content, /XSWD wallet is not connected/u);
+  assert.match((await builtinExecutors.dero_wallet_scinvoke({ scid: '0'.repeat(64), entrypoint: 'Test' }, ctx)).content, /XSWD wallet is not connected/u);
+
+  // Connected paths via a mocked manager (mirrors the simulator mock below).
+  setXswdManager({
+    status() { return { state: 'connected', url: 'ws://127.0.0.1:44326/xswd', appName: 'test', connectedAt: 1, error: null }; },
+    async getAddress() { return 'dero1qytest'; },
+    async getBalance() { return { balance: 500000, unlocked_balance: 400000 }; },
+    async getHeight() { return 4242; },
+    async getTransfers() { return { entries: [{ txid: 'a'.repeat(64), amount: 1 }] }; },
+    async transfer() { return { txid: 'b'.repeat(64) }; },
+    async scinvoke() { return { txid: 'c'.repeat(64) }; }
+  } as never);
+  assert.match((await builtinExecutors.dero_wallet_address({}, ctx)).content, /dero1qytest/u);
+  assert.match((await builtinExecutors.dero_wallet_balance({}, ctx)).content, /4\.00000 DERO/u);
+  assert.equal((await builtinExecutors.dero_wallet_balance({ scid: 'not-hex' }, ctx)).isError, true);
+  assert.match((await builtinExecutors.dero_wallet_height({}, ctx)).content, /4242/u);
+  assert.match((await builtinExecutors.dero_wallet_history({}, ctx)).content, /1 wallet transaction/u);
+  assert.equal((await builtinExecutors.dero_wallet_transfer({ destination: 'dero1abc' }, ctx)).isError, true);
+  assert.equal((await builtinExecutors.dero_wallet_transfer({ destination: 'dero1abc', amount: 1.5 }, ctx)).isError, true);
+  assert.match((await builtinExecutors.dero_wallet_transfer({ destination: 'dero1abc', amount: 100 }, ctx)).content, new RegExp('b'.repeat(64), 'u'));
+  assert.equal((await builtinExecutors.dero_wallet_scinvoke({ scid: 'short', entrypoint: 'X' }, ctx)).isError, true);
+  assert.equal((await builtinExecutors.dero_wallet_scinvoke({ scid: '0'.repeat(64), entrypoint: 'X', parameters: [{ name: 'n', datatype: 'U', value: 'not-int' }] }, ctx)).isError, true);
+  assert.match(
+    (await builtinExecutors.dero_wallet_scinvoke({ scid: '0'.repeat(64), entrypoint: 'Transfer', parameters: [{ name: 'to', datatype: 'S', value: 'x' }] }, ctx)).content,
+    new RegExp('c'.repeat(64), 'u')
+  );
+  setXswdManager(null);
+
   setMediaManager({
     autoPick(kind: string) { return { providerId: 'fake', model: `fake-${kind}` }; },
     async generate(request: { kind: string; prompt: string }) {
@@ -78,6 +115,7 @@ try {
   globalThis.fetch = originalFetch;
   setMediaManager(null);
   setSimulatorManager(null);
+  setXswdManager(null);
   delete process.env.HIVE_CLI;
   rmSync(root, { recursive: true, force: true });
 }

@@ -9,6 +9,9 @@ export interface CliState {
   systemPrompt?: string;
   goal?: string;
   goalPaused?: boolean;
+  /** User opted into the XSWD wallet bridge (Alt+X / /xswd on). Persisted intent:
+   *  survives restarts and connection drops; only toggleXswd//xswd changes it. */
+  xswdEnabled?: boolean;
   memory?: string[];
   memoryEnabled?: boolean;
   lastPlan?: string;
