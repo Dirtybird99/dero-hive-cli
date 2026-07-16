@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BUILTIN_TOOLS, builtinExecutors } from './builtin.js';
+import { BUILTIN_TOOLS, builtinExecutors, htmlToText, isBlockedUrl, isBlockedAddress, parseDuckDuckGoHtml, __setHostResolverForTest } from './builtin.js';
 import { setMediaManager } from '../media/instance.js';
 import { setSimulatorManager } from '../simulator/instance.js';
 import { setXswdManager } from '../xswd/instance.js';
@@ -11,7 +11,7 @@ const root = mkdtempSync(join(tmpdir(), 'dero-hive-tools-'));
 const ctx = { cwd: root, conversationId: 'tool-test' };
 const originalFetch = globalThis.fetch;
 
-assert.equal(BUILTIN_TOOLS.length, 27);
+assert.equal(BUILTIN_TOOLS.length, 29);
 assert.equal(new Set(BUILTIN_TOOLS.map(({ name }) => name)).size, BUILTIN_TOOLS.length);
 assert.deepEqual(Object.keys(builtinExecutors).sort(), BUILTIN_TOOLS.map(({ name }) => name).sort());
 
@@ -331,8 +331,108 @@ try {
   const genThrow = await builtinExecutors.generate_audio({ text: 'hello' }, ctx);
   assert.equal(genThrow.isError, true);
   assert.match(genThrow.content, /Media generation failed/u);
+
+  // ---- web tools: SSRF guard (pure, no network) ----
+  // Blocked: localhost (incl. trailing dot), private/link-local/CGNAT/multicast/reserved/
+  // broadcast/unspecified, cloud metadata, IPv4-mapped IPv6 (incl. the hex form Node emits
+  // for ::ffff:127.0.0.1 and ::ffff:169.254.169.254), and non-http(s) schemes.
+  for (const bad of [
+    'http://localhost:8080', 'http://localhost./', 'http://127.0.0.1/', 'http://127.0.0.1./',
+    'http://10.0.0.5/', 'http://192.168.1.1/', 'http://172.16.0.1/', 'http://100.64.0.1/',
+    'http://169.254.169.254/latest', 'http://224.0.0.1/', 'http://240.0.0.1/',
+    'http://255.255.255.255/', 'http://192.0.2.5/', 'http://[::1]/', 'http://[::]/',
+    'http://[fe80::1]/', 'http://[fc00::1]/', 'http://[::ffff:7f00:1]/', 'http://[::ffff:127.0.0.1]/',
+    'http://[::ffff:a9fe:a9fe]/', 'ftp://example.com/', 'file:///etc/passwd', 'not a url'
+  ]) {
+    assert.equal(isBlockedUrl(bad).blocked, true, `expected ${bad} to be blocked`);
+  }
+  // Public hosts pass — including public IPv6 and IPv4-mapped-public (must not over-block).
+  for (const ok of [
+    'https://example.com/path', 'http://8.8.8.8/', 'http://93.184.216.34/',
+    'http://[2606:4700:4700::1111]/', 'http://[2001:4860:4860::8888]/', 'http://[::ffff:8.8.8.8]/'
+  ]) {
+    assert.equal(isBlockedUrl(ok).blocked, false, `expected ${ok} to be allowed`);
+  }
+  // isBlockedAddress: the shared IP-classification core used by the guard and the DNS re-check.
+  for (const bad of ['127.0.0.1', '10.0.0.5', '169.254.169.254', '224.0.0.1', '240.0.0.1', '255.255.255.255', '100.64.0.1', '::1', 'fe80::1', '::ffff:7f00:1', '::ffff:a9fe:a9fe']) {
+    assert.equal(isBlockedAddress(bad), true, `expected address ${bad} blocked`);
+  }
+  for (const ok of ['8.8.8.8', '93.184.216.34', '2606:4700:4700::1111', '::ffff:8.8.8.8']) {
+    assert.equal(isBlockedAddress(ok), false, `expected address ${ok} allowed`);
+  }
+
+  // htmlToText drops script/style, decodes entities, and turns block/br boundaries into newlines.
+  const sampleHtml = '<html><head><style>b{color:red}</style><script>evil()</script></head><body><h1>Title</h1><p>Hello &amp; welcome</p><div>Line1<br>Line2</div></body></html>';
+  const asText = htmlToText(sampleHtml);
+  assert.match(asText, /Title/u);
+  assert.match(asText, /Hello & welcome/u);
+  assert.match(asText, /Line1\nLine2/u);
+  assert.doesNotMatch(asText, /evil\(\)/u);
+  assert.doesNotMatch(asText, /color:red/u);
+
+  // parseDuckDuckGoHtml extracts title/url/snippet and decodes the uddg redirect param.
+  const ddgHtml = `
+    <div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&rut=x">First <b>Result</b></a>
+    <a class="result__snippet" href="#">A snippet about the <b>first</b> result.</a></div>
+    <div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fb">Second Result</a>
+    <a class="result__snippet" href="#">Another snippet.</a></div>`;
+  const parsed = parseDuckDuckGoHtml(ddgHtml);
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].url, 'https://example.com/a');
+  assert.equal(parsed[0].title, 'First Result');
+  assert.match(parsed[0].snippet, /snippet about the first result/u);
+  assert.equal(parsed[1].url, 'https://example.org/b');
+
+  // web_fetch resolves DNS-name hosts before connecting; inject a public resolver so
+  // these mocked-fetch cases never touch the real network.
+  __setHostResolverForTest(async () => ['93.184.216.34']);
+
+  // ---- web_fetch executor ----
+  // Guard rejects blocked URLs and missing input before any fetch.
+  const fetchBlocked = await builtinExecutors.web_fetch({ url: 'http://169.254.169.254/' }, ctx);
+  assert.equal(fetchBlocked.isError, true);
+  assert.match(fetchBlocked.content, /Refusing to fetch/u);
+  assert.equal((await builtinExecutors.web_fetch({}, ctx)).isError, true);
+
+  // Success: HTML body is reduced to text.
+  globalThis.fetch = async () => new Response('<h1>Doc</h1><p>Body text.</p>', { status: 200, headers: { 'content-type': 'text/html' } });
+  const fetchOk = await builtinExecutors.web_fetch({ url: 'https://example.com/' }, ctx);
+  assert.equal(fetchOk.isError, undefined);
+  assert.match(fetchOk.content, /Doc/u);
+  assert.match(fetchOk.content, /Body text\./u);
+  assert.doesNotMatch(fetchOk.content, /<h1>/u);
+
+  // Non-text content is not dumped.
+  globalThis.fetch = async () => new Response('binarydata', { status: 200, headers: { 'content-type': 'application/octet-stream' } });
+  const fetchBinary = await builtinExecutors.web_fetch({ url: 'https://example.com/x.bin' }, ctx);
+  assert.match(fetchBinary.content, /body omitted/u);
+
+  // max_bytes truncates the returned body.
+  globalThis.fetch = async () => new Response('x'.repeat(500), { status: 200, headers: { 'content-type': 'text/plain' } });
+  const fetchTrunc = await builtinExecutors.web_fetch({ url: 'https://example.com/big', max_bytes: 100 }, ctx);
+  assert.match(fetchTrunc.content, /truncated at 100 chars/u);
+
+  // ---- web_search executor (keyless DuckDuckGo fallback) ----
+  delete process.env.HIVE_SEARCH_API_KEY;
+  globalThis.fetch = async () => new Response(ddgHtml, { status: 200, headers: { 'content-type': 'text/html' } });
+  const searchOk = await builtinExecutors.web_search({ query: 'dero hive', count: 2 }, ctx);
+  assert.equal(searchOk.isError, undefined);
+  assert.match(searchOk.content, /example\.com\/a/u);
+  assert.equal((searchOk.meta?.results as unknown[])?.length, 2);
+  // Missing query is rejected.
+  assert.equal((await builtinExecutors.web_search({}, ctx)).isError, true);
+
+  // ---- web_fetch: DNS-rebinding re-check at fetch time ----
+  // A hostname that passes the string guard but RESOLVES to a loopback/private
+  // address is rejected before any connection (the string guard can't resolve DNS).
+  __setHostResolverForTest(async () => ['127.0.0.1']);
+  globalThis.fetch = async () => new Response('should not be reached', { status: 200, headers: { 'content-type': 'text/html' } });
+  const rebind = await builtinExecutors.web_fetch({ url: 'https://rebind.evil.example/' }, ctx);
+  assert.equal(rebind.isError, true);
+  assert.match(rebind.content, /non-public address/u);
 } finally {
   globalThis.fetch = originalFetch;
+  __setHostResolverForTest(null);
   setMediaManager(null);
   setSimulatorManager(null);
   setXswdManager(null);

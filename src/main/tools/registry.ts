@@ -6,6 +6,7 @@ import { BUILTIN_TOOLS, builtinExecutors } from './builtin';
 import { McpManager } from '../mcp/manager';
 import { getXswdManager } from '../xswd/instance';
 import { reviewXswdTransfer, reviewXswdScInvoke, type XswdTransferParams, type XswdScInvokeParams } from '../xswd/safety';
+import { runPreToolUse, runPostToolUse } from '../hooks/dispatcher';
 
 export interface ToolContext {
   cwd: string;
@@ -68,6 +69,13 @@ export class ToolRegistry extends EventEmitter {
     // whether the tool needs approval depends on that server's trust flag.
     const mcp = this.executors.has(name) ? null : (this.mcpManager?.resolveTool(name) ?? null);
 
+    // preToolUse hooks run before the permission gate. A hook `deny` (or a
+    // failing blocking hook) short-circuits the call before the executor runs.
+    const pre = await runPreToolUse(name, args, ctx);
+    if (pre.block) {
+      return { content: `Blocked by preToolUse hook: ${name}${pre.feedback ? ` — ${pre.feedback}` : ''}`, isError: true };
+    }
+
     // Check permissions
     const rule = this.matchRule(name, args, ctx);
     if (rule?.action === 'deny') {
@@ -103,30 +111,33 @@ export class ToolRegistry extends EventEmitter {
       if (!allowed) return { content: `User denied: ${name}`, isError: true };
     }
 
-    // Built-in
+    // Execute (built-in, then MCP, then unknown), capturing a single result so
+    // postToolUse hooks observe every executed call before it is returned.
+    let result: ToolResult;
     const builtin = this.executors.get(name);
     if (builtin) {
-      try { return await builtin(args, ctx); }
-      catch (err) { return { content: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true }; }
-    }
-
-    if (mcp) {
+      try { result = await builtin(args, ctx); }
+      catch (err) { result = { content: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true }; }
+    } else if (mcp) {
       try {
-        const result = await this.mcpManager!.callTool(mcp.serverId, mcp.toolName, args);
-        const content = Array.isArray(result.content)
-          ? (result.content as Array<{ type: string; text?: string }>).map((c) => c.text || JSON.stringify(c)).join('\n')
-          : String(result.content);
-        return {
+        const mcpResult = await this.mcpManager!.callTool(mcp.serverId, mcp.toolName, args);
+        const content = Array.isArray(mcpResult.content)
+          ? (mcpResult.content as Array<{ type: string; text?: string }>).map((c) => c.text || JSON.stringify(c)).join('\n')
+          : String(mcpResult.content);
+        result = {
           content,
-          isError: result.isError,
+          isError: mcpResult.isError,
           meta: { source: `mcp:${mcp.serverId}`, serverName: mcp.serverName }
         };
       } catch (err) {
-        return { content: `MCP tool error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+        result = { content: `MCP tool error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
       }
+    } else {
+      result = { content: `Unknown tool: ${name}`, isError: true };
     }
 
-    return { content: `Unknown tool: ${name}`, isError: true };
+    await runPostToolUse(name, args, result, ctx);
+    return result;
   }
 
   matchRule(toolName: string, args: Record<string, unknown>, ctx?: ToolContext): PermissionRule | null {
