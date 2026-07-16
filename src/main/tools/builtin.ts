@@ -9,6 +9,7 @@ import { resolveAndValidate } from '../utils/pathPolicy';
 import type { ToolExecutor, ToolContext, ToolResult } from './registry';
 import { getMediaManager } from '../media/instance';
 import { getSimulatorManager } from '../simulator/instance';
+import { getXswdManager } from '../xswd/instance';
 import { lintDvmBasic } from '@shared/dvm';
 import type { IndexQuery } from '@shared/gnomon';
 import { diffLines, diffCounts } from '@shared/diff';
@@ -316,6 +317,94 @@ const DISCOVER_CONTRACTS_DEF: ToolDefinition = {
   }
 };
 
+const WALLET_ADDRESS_DEF: ToolDefinition = {
+  name: 'dero_wallet_address',
+  description: 'Get the receiving address of the user\'s connected DERO wallet (via XSWD). Requires the XSWD wallet connection to be enabled.',
+  source: 'builtin',
+  parameters: { type: 'object', properties: {} }
+};
+
+const WALLET_BALANCE_DEF: ToolDefinition = {
+  name: 'dero_wallet_balance',
+  description: 'Get the balance of the user\'s connected DERO wallet (via XSWD). Amounts are atomic units: 1 DERO = 100000.',
+  source: 'builtin',
+  parameters: {
+    type: 'object',
+    properties: {
+      scid: { type: 'string', description: 'Token SCID (64-hex) to query a token balance; omit for native DERO.' }
+    }
+  }
+};
+
+const WALLET_HEIGHT_DEF: ToolDefinition = {
+  name: 'dero_wallet_height',
+  description: 'Get the current block height as seen by the user\'s connected DERO wallet (via XSWD).',
+  source: 'builtin',
+  parameters: { type: 'object', properties: {} }
+};
+
+const WALLET_HISTORY_DEF: ToolDefinition = {
+  name: 'dero_wallet_history',
+  description: 'List transaction entries from the user\'s connected DERO wallet (via XSWD). Amounts are atomic units: 1 DERO = 100000.',
+  source: 'builtin',
+  parameters: {
+    type: 'object',
+    properties: {
+      in: { type: 'boolean', description: 'Include incoming entries. Default true.' },
+      out: { type: 'boolean', description: 'Include outgoing entries. Default true.' },
+      coinbase: { type: 'boolean', description: 'Include coinbase entries. Default false.' },
+      min_height: { type: 'integer', description: 'Only entries at or above this height.' },
+      max_height: { type: 'integer', description: 'Only entries at or below this height.' }
+    }
+  }
+};
+
+const WALLET_TRANSFER_DEF: ToolDefinition = {
+  name: 'dero_wallet_transfer',
+  description: 'Send DERO (or a token) from the user\'s connected wallet via XSWD. amount is in atomic units: 1 DERO = 100000. The user\'s wallet will show its own confirmation dialog before broadcasting.',
+  source: 'builtin',
+  parameters: {
+    type: 'object',
+    properties: {
+      destination: { type: 'string', description: 'Destination DERO address (dero1... / deto1...).' },
+      amount: { type: 'integer', description: 'Amount in atomic units (1 DERO = 100000). Must be a positive integer.' },
+      scid: { type: 'string', description: 'Token SCID (64-hex) to send a token instead of native DERO.' },
+      ringsize: { type: 'integer', description: 'Anonymity ring size (power of 2, 2-128). Default 16.' }
+    },
+    required: ['destination', 'amount']
+  }
+};
+
+const WALLET_SCINVOKE_DEF: ToolDefinition = {
+  name: 'dero_wallet_scinvoke',
+  description: 'Invoke a DERO smart contract entrypoint from the user\'s connected wallet via XSWD. Contract deposits are burn semantics and use atomic units: 1 DERO = 100000. Hive and the wallet both require approval.',
+  source: 'builtin',
+  parameters: {
+    type: 'object',
+    properties: {
+      scid: { type: 'string', description: 'Smart contract ID (64-hex).' },
+      entrypoint: { type: 'string', description: 'Contract function name to invoke.' },
+      parameters: {
+        type: 'array',
+        description: 'Additional entrypoint arguments.',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Argument name.' },
+            datatype: { type: 'string', enum: ['S', 'U'], description: 'S = string, U = uint64.' },
+            value: { description: 'Argument value (string or integer to match datatype).' }
+          },
+          required: ['name', 'datatype', 'value']
+        }
+      },
+      sc_dero_deposit: { type: 'integer', description: 'DERO burned/deposited into the contract, atomic units. Default 0.' },
+      sc_token_deposit: { type: 'integer', description: 'Token amount burned/deposited into the contract, atomic units. Default 0.' },
+      ringsize: { type: 'integer', description: 'Anonymity ring size. Default 2.' }
+    },
+    required: ['scid', 'entrypoint']
+  }
+};
+
 export const BUILTIN_TOOLS: ToolDefinition[] = [
   READ_FILE_DEF, WRITE_FILE_DEF, EDIT_FILE_DEF,
   LIST_DIR_DEF, GLOB_DEF, GREP_DEF,
@@ -325,10 +414,148 @@ export const BUILTIN_TOOLS: ToolDefinition[] = [
   GENERATE_DVM_CONTRACT_DEF,
   AUDIT_DVM_CONTRACT_DEF,
   GENERATE_TELA_DAPP_DEF,
-  DISCOVER_CONTRACTS_DEF
+  DISCOVER_CONTRACTS_DEF,
+  WALLET_ADDRESS_DEF, WALLET_BALANCE_DEF, WALLET_HEIGHT_DEF, WALLET_HISTORY_DEF,
+  WALLET_TRANSFER_DEF, WALLET_SCINVOKE_DEF
 ];
 
+const ATOMIC_PER_DERO = 100000;
+const SCID_RE = /^[0-9a-fA-F]{64}$/;
+
+function xswdOffline(): ToolResult {
+  return {
+    content: 'XSWD wallet is not connected. Ask the user to enable it: press Alt+X or run /xswd on. A DERO wallet with XSWD enabled (Engram, derotui, HOLOGRAM) must be running at ws://127.0.0.1:44326/xswd.',
+    isError: true
+  };
+}
+
+function connectedXswd(): ReturnType<typeof getXswdManager> {
+  const mgr = getXswdManager();
+  if (!mgr || mgr.status().state !== 'connected') return null;
+  return mgr;
+}
+
 export const builtinExecutors: Record<string, ToolExecutor> = {
+  async dero_wallet_address() {
+    const mgr = connectedXswd();
+    if (!mgr) return xswdOffline();
+    try {
+      const address = await mgr.getAddress();
+      return { content: `Wallet address: ${address}`, meta: { address } };
+    } catch (err) {
+      return { content: `Wallet address lookup failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+    }
+  },
+
+  async dero_wallet_balance(args) {
+    const mgr = connectedXswd();
+    if (!mgr) return xswdOffline();
+    const scid = typeof args.scid === 'string' && args.scid.trim() ? args.scid.trim() : undefined;
+    if (scid && !SCID_RE.test(scid)) return { content: 'scid must be a 64-character hex string.', isError: true };
+    try {
+      const b = await mgr.getBalance(scid);
+      const dero = (b.unlocked_balance / ATOMIC_PER_DERO).toFixed(5);
+      return {
+        content: `Balance: ${b.balance} atomic units (unlocked ${b.unlocked_balance}) = ${dero} DERO unlocked${scid ? ` for token ${scid}` : ''}`,
+        meta: b
+      };
+    } catch (err) {
+      return { content: `Wallet balance lookup failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+    }
+  },
+
+  async dero_wallet_height() {
+    const mgr = connectedXswd();
+    if (!mgr) return xswdOffline();
+    try {
+      const height = await mgr.getHeight();
+      return { content: `Wallet block height: ${height}`, meta: { height } };
+    } catch (err) {
+      return { content: `Wallet height lookup failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+    }
+  },
+
+  async dero_wallet_history(args) {
+    const mgr = connectedXswd();
+    if (!mgr) return xswdOffline();
+    try {
+      const result = await mgr.getTransfers({
+        in: typeof args.in === 'boolean' ? args.in : true,
+        out: typeof args.out === 'boolean' ? args.out : true,
+        coinbase: typeof args.coinbase === 'boolean' ? args.coinbase : false,
+        ...(typeof args.min_height === 'number' ? { min_height: args.min_height } : {}),
+        ...(typeof args.max_height === 'number' ? { max_height: args.max_height } : {})
+      });
+      const count = result.entries.length;
+      return {
+        content: count === 0
+          ? 'No matching wallet transactions.'
+          : `${count} wallet transaction(s):\n${JSON.stringify(result.entries, null, 2)}`,
+        meta: { count }
+      };
+    } catch (err) {
+      return { content: `Wallet history lookup failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+    }
+  },
+
+  async dero_wallet_transfer(args) {
+    const mgr = connectedXswd();
+    if (!mgr) return xswdOffline();
+    const { destination, amount } = args as { destination?: unknown; amount?: unknown };
+    if (!destination || typeof destination !== 'string') return { content: 'destination is required.', isError: true };
+    if (typeof amount !== 'number' || !Number.isInteger(amount) || amount <= 0) {
+      return { content: 'amount must be a positive integer in atomic units (1 DERO = 100000).', isError: true };
+    }
+    const scid = typeof args.scid === 'string' && args.scid.trim() ? args.scid.trim() : undefined;
+    if (scid && !SCID_RE.test(scid)) return { content: 'scid must be a 64-character hex string.', isError: true };
+    try {
+      const { txid } = await mgr.transfer({
+        destination,
+        amount,
+        scid,
+        ringsize: typeof args.ringsize === 'number' ? args.ringsize : undefined
+      });
+      return { content: `Transaction submitted. TXID: ${txid}`, meta: { txid } };
+    } catch (err) {
+      return { content: `Transfer failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+    }
+  },
+
+  async dero_wallet_scinvoke(args) {
+    const mgr = connectedXswd();
+    if (!mgr) return xswdOffline();
+    const { scid, entrypoint } = args as { scid?: unknown; entrypoint?: unknown };
+    if (!scid || typeof scid !== 'string' || !SCID_RE.test(scid)) {
+      return { content: 'scid is required and must be a 64-character hex string.', isError: true };
+    }
+    if (!entrypoint || typeof entrypoint !== 'string') return { content: 'entrypoint is required.', isError: true };
+    const rawParams = Array.isArray(args.parameters) ? args.parameters : [];
+    const parameters: Array<{ name: string; datatype: 'S' | 'U'; value: string | number }> = [];
+    for (const p of rawParams) {
+      const item = p as { name?: unknown; datatype?: unknown; value?: unknown };
+      if (typeof item.name !== 'string' || (item.datatype !== 'S' && item.datatype !== 'U')) {
+        return { content: 'each parameter needs a name and a datatype of S or U.', isError: true };
+      }
+      if (item.datatype === 'U' && typeof item.value !== 'number') {
+        return { content: `parameter ${item.name} has datatype U and needs an integer value.`, isError: true };
+      }
+      parameters.push({ name: item.name, datatype: item.datatype, value: item.value as string | number });
+    }
+    try {
+      const { txid } = await mgr.scinvoke({
+        scid,
+        entrypoint,
+        parameters,
+        sc_dero_deposit: typeof args.sc_dero_deposit === 'number' ? args.sc_dero_deposit : undefined,
+        sc_token_deposit: typeof args.sc_token_deposit === 'number' ? args.sc_token_deposit : undefined,
+        ringsize: typeof args.ringsize === 'number' ? args.ringsize : undefined
+      });
+      return { content: `Contract call submitted. TXID: ${txid}`, meta: { txid } };
+    } catch (err) {
+      return { content: `Contract invocation failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+    }
+  },
+
   async read_file(args, ctx: ToolContext) {
     const { path, start_line, end_line, encoding } = args as { path: string; start_line?: number; end_line?: number; encoding?: 'utf-8' | 'base64' };
     const abs = safeResolve(path, ctx.cwd);

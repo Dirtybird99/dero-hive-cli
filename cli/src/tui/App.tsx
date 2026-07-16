@@ -22,12 +22,12 @@ import { BUILTIN_SKILLS } from '../../../src/shared/defaults.js';
 import { PROVIDER_PRESETS } from '../../../src/shared/presets.js';
 import { BUILTIN_AGENTS, resolveAgent } from '../../../src/shared/agents.js';
 import { thinkingOptionsFor, usesDefaultThinkingOptions } from '../../../src/shared/thinkingCapabilities.js';
-import { normalizeToolApprovalMode, type AppSettings, type ContentPart, type MediaKind, type Message, type PermissionRule, type ProviderConfig, type ThinkingEffort, type TokenUsage, type ToolApprovalMode } from '../../../src/shared/types.js';
+import { normalizeToolApprovalMode, type AppSettings, type ContentPart, type MediaKind, type Message, type PermissionRule, type ProviderConfig, type ThinkingEffort, type TokenUsage, type ToolApprovalMode, type XswdStatus } from '../../../src/shared/types.js';
 import { APP_VERSION } from '../../../src/shared/version.js';
 import { commandSuggestions, parseSlashCommand, type CommandSuggestion } from './commands.js';
 import { listThemes, nextTheme, resolveTheme, type TerminalThemeId } from './themes.js';
 import { DISABLE_SGR_MOUSE, ENABLE_SGR_MOUSE, SgrMouseParser } from './mouse.js';
-import { CommandMenu, ComposerInput, Header, PermissionPrompt, Picker, StatusBar, Transcript, WELCOME_ACTIONS, type PermissionView, type PickerItem, type ToolActivity, type WelcomeActionId } from './components.js';
+import { CommandMenu, ComposerInput, Header, isAltKey, PermissionPrompt, Picker, StatusBar, Transcript, WELCOME_ACTIONS, type PermissionView, type PickerItem, type ToolActivity, type WelcomeActionId } from './components.js';
 
 const execAsync = promisify(exec);
 const EMPTY_USAGE: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -59,6 +59,7 @@ const SHORTCUT_ITEMS: PickerItem[] = [
   { id: 'multiline-send', label: 'Send multiline prompt', detail: 'Shift+Enter or Alt+Enter', group: 'Input' },
   { id: 'select-all', label: 'Select all input', detail: 'Ctrl+A', group: 'Input' },
   { id: 'extensions', label: 'Skills and MCP extensions', detail: 'Ctrl+L', group: 'Panels' },
+  { id: 'xswd', label: 'Toggle XSWD wallet bridge', detail: 'Alt+X', group: 'Panels' },
   { id: 'approval', label: 'Toggle Always-Approve', detail: 'Ctrl+O', group: 'Conversation Actions' },
   { id: 'tasks', label: 'Task dashboard', detail: 'Ctrl+T or Ctrl+B', group: 'Dashboard' }
 ];
@@ -356,6 +357,8 @@ export function App({ options = {} }: AppProps): JSX.Element {
   cwdRef.current = cwd;
   streamingRef.current = streaming;
 
+  const [xswdStatus, setXswdStatus] = useState<XswdStatus | null>(null);
+
   const appSettings = config.getSettingDirect<Partial<AppSettings>>('appSettings') || {};
   const [installedSkills, setInstalledSkills] = useState(() => {
     try {
@@ -420,12 +423,32 @@ export function App({ options = {} }: AppProps): JSX.Element {
   }, [stdout, theme.palette.background, theme.palette.foreground]);
 
   useEffect(() => {
+    const xswd = getContext().xswd;
+    const onStatus = (status: XswdStatus): void => {
+      setXswdStatus(status);
+      if (status.state === 'connecting') showNotice('XSWD · connecting to wallet…');
+      else if (status.state === 'awaiting-approval') showNotice('XSWD · approve DERO Hive in your wallet…');
+      else if (status.state === 'connected') showNotice('XSWD wallet connected.');
+      // xswdEnabled is the user's persisted intent, changed only via toggleXswd/`/xswd`.
+      // A failed connect or an unexpected drop must NOT erase it, or a launch before the
+      // wallet is up would permanently disable auto-connect. The footer badge reflects the
+      // live state instead.
+      else if (status.state === 'error') showNotice(status.error || 'XSWD connection failed.', true);
+      else if (status.state === 'disconnected' && status.error) showNotice(status.error, true);
+    };
+    xswd.on('status', onStatus);
+    if (cliRef.current.xswdEnabled) void xswd.connect();
+    return () => { xswd.off('status', onStatus); };
+  }, []);
+
+  useEffect(() => {
     setPermissionHandler((request) => new Promise<boolean>((resolvePermission) => {
       setPermission({
         requestId: request.requestId,
         toolName: request.toolName,
         args: summarisePermissionArgs(request.toolName, request.args),
         description: request.description,
+        reviewLines: request.reviewLines,
         projectPath: request.projectPath,
         resolve: resolvePermission
       });
@@ -462,6 +485,13 @@ export function App({ options = {} }: AppProps): JSX.Element {
   function showNotice(text: string, isError = false): void {
     setNotice(text);
     setNoticeError(isError);
+  }
+
+  function toggleXswd(target?: boolean): void {
+    const enabled = target ?? !cliRef.current.xswdEnabled;
+    commitCli({ xswdEnabled: enabled });
+    if (enabled) void getContext().xswd.connect();
+    else { void getContext().xswd.disconnect(); showNotice('XSWD wallet disconnected.'); }
   }
 
   function appendLocal(text: string, isError = false): void {
@@ -1357,6 +1387,14 @@ export function App({ options = {} }: AppProps): JSX.Element {
           undefined,
           `Review-only turn: inspect files and diffs, but do not modify files or run state-changing tools.\n\n${reviewSkill?.prompt || ''}`
         );
+        return;
+      }
+      case 'xswd': {
+        const arg = argument.trim().toLowerCase();
+        if (arg === 'on') { toggleXswd(true); return; }
+        if (arg === 'off') { toggleXswd(false); return; }
+        const s = getContext().xswd.status();
+        showNotice(`XSWD ${s.state}${s.error ? ` · ${s.error}` : ''} · ${s.url} · toggle with /xswd on|off or Alt+X`);
         return;
       }
       case 'settings': openOverlay('settings', argument); return;
@@ -2320,6 +2358,7 @@ export function App({ options = {} }: AppProps): JSX.Element {
       return;
     }
     if (key.ctrl && character === 'x') { openOverlay('shortcuts'); return; }
+    if (isAltKey(character, key, 'x')) { toggleXswd(); return; }
     if (key.ctrl && character === 'p') {
       openOverlay('help');
       return;
@@ -2469,11 +2508,17 @@ export function App({ options = {} }: AppProps): JSX.Element {
       : dimensions.columns >= 84 ? 'ctrl+p commands · /model · /multiline'
         : dimensions.columns >= 60 ? '/commands · ctrl+p palette'
           : '';
-  const footerState = welcome ? footerMode
+  const xswdBadge = xswdStatus?.state === 'connected' ? 'xswd:on'
+    : xswdStatus?.state === 'awaiting-approval' ? 'xswd:approve'
+      : xswdStatus?.state === 'connecting' ? 'xswd:…'
+        : xswdStatus?.state === 'error' ? 'xswd:err'
+          : cliState.xswdEnabled ? 'xswd:off' : null;
+  const footerBase = welcome ? footerMode
     : dimensions.columns >= 110 ? `${footerMode} · ${footerAgent} · ${approvalMode} · ${workspaceName.slice(0, 18)}`
       : dimensions.columns >= 84 ? `${footerMode} · ${footerAgent} · ${approvalMode}`
         : dimensions.columns >= 60 ? `${footerMode} · ${footerAgent}`
           : footerMode;
+  const footerState = !welcome && xswdBadge && dimensions.columns >= 60 ? `${footerBase} · ${xswdBadge}` : footerBase;
 
   useEffect(() => {
     if (!stdin.isTTY || !stdout.isTTY) return;

@@ -32,12 +32,22 @@ stdout.on('data', (chunk) => { output += chunk.toString(); });
 
 const { initHive, shutdownHive } = await import('../utils/init.js');
 const { App } = await import('./App.js');
-const { CommandMenu, ComposerInput, StatusBar, Welcome, glimmerLevel } = await import('./components.js');
+const { CommandMenu, ComposerInput, StatusBar, Welcome, glimmerLevel, isAltKey } = await import('./components.js');
 const { resolveTheme } = await import('./themes.js');
 
 let composerValue = 'z';
 let composerSubmits = 0;
 assert.equal(glimmerLevel(0, 1), 2, 'the glimmer head should light the current logo column');
+
+// Alt+<letter> detection: Ink meta flag, CSI-u, and legacy escape forms all match;
+// Ctrl combinations and other letters must not.
+assert.equal(isAltKey('x', { meta: true }, 'x'), true, 'meta+x is Alt+X');
+assert.equal(isAltKey('X', { meta: true }, 'x'), true, 'meta is case-insensitive');
+assert.equal(isAltKey('[120;3u', {}, 'x'), true, 'CSI-u Alt+X escape matches');
+assert.equal(isAltKey('[27;3;120~', {}, 'x'), true, 'legacy Alt+X escape matches');
+assert.equal(isAltKey('x', { meta: true, ctrl: true }, 'x'), false, 'ctrl+meta is not Alt');
+assert.equal(isAltKey('y', { meta: true }, 'x'), false, 'other letters do not match');
+assert.equal(isAltKey('x', {}, 'x'), false, 'bare letter is not Alt');
 assert.equal(glimmerLevel(0, 2), 1, 'the glimmer should leave a one-column trail');
 assert.equal(glimmerLevel(0, 10), 0, 'the logo should rest between sweeps');
 assert.equal(glimmerLevel(6, 7), 2, 'the glimmer sweep should reach the final logo column');

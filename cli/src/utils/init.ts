@@ -8,11 +8,14 @@ import type { PermissionRequest } from '../../../src/main/tools/registry.js';
 import { MediaManager } from '../../../src/main/media/manager.js';
 import { setMediaManager } from '../../../src/main/media/instance.js';
 import { shutdownAdapterCache } from '../../../src/main/providers/registry.js';
+import { XswdManager } from '../../../src/main/xswd/manager.js';
+import { setXswdManager } from '../../../src/main/xswd/instance.js';
 
 export interface HiveContext {
   mcpManager: McpManager;
   tools: ToolRegistry;
   mediaManager: MediaManager;
+  xswd: XswdManager;
 }
 
 let context: HiveContext | null = null;
@@ -34,6 +37,11 @@ export async function initHive(): Promise<HiveContext> {
   const tools = new ToolRegistry(mcpManager);
   const mediaManager = new MediaManager();
   setMediaManager(mediaManager);
+  // XSWD wallet bridge: constructed up front so builtin dero_wallet_* tools can
+  // resolve it via getXswdManager(); no connection is made until the user opts in
+  // (Alt+X / /xswd on) — connecting triggers the wallet's own approval dialog.
+  const xswd = new XswdManager('cli');
+  setXswdManager(xswd);
 
   // Interactive TUI prompts are rendered in-app. Plain subcommands retain an
   // Inquirer fallback, while non-interactive runs fail closed.
@@ -55,7 +63,7 @@ export async function initHive(): Promise<HiveContext> {
     tools.decidePermission(req.requestId, allowed ? 'allow' : 'deny');
   });
 
-  context = { mcpManager, tools, mediaManager };
+  context = { mcpManager, tools, mediaManager, xswd };
   logger.info('cli', 'Hive CLI initialized');
   return context;
 }
@@ -68,6 +76,8 @@ export function getContext(): HiveContext {
 export async function shutdownHive(): Promise<void> {
   await shutdownAdapterCache();
   if (context) {
+    await context.xswd.disconnect();
+    setXswdManager(null);
     await context.mcpManager.shutdownAll();
     setMediaManager(null);
     context = null;

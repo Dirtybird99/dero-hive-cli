@@ -9,12 +9,14 @@
  * The CBOR map keys are `Name + DataType` ASCII strings (e.g. `"VU"` for
  * `RPC_VALUE_TRANSFER` + `DataUint64`). Values are typed CBOR primitives.
  *
- * No new npm dependencies — bech32 + the minimum-needed CBOR subset are hand-rolled
- * (~zero kB install delta for the MCP server, which is published for `npx` use).
+ * Bech32 + the minimum-needed CBOR subset are hand-rolled. Compressed public
+ * keys are checked with the server's existing DERO BN254 implementation.
  *
  * Verified against the publicly-cited 2022 inflation-claim proof string:
  *   embedded `uint64` = 18446743853709551435 = signed -2,200,000.00181 DERO.
  */
+
+import { deroDecompress } from './bn254.js'
 
 const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
 const BECH32_CHARSET_INDEX: Record<string, number> = Object.fromEntries(
@@ -120,11 +122,11 @@ export function convertBits(
 //   - major type 3 (text string)             → string
 //   - major type 4 (array)                   → unknown[] (rare here, supported)
 //   - major type 5 (map)                     → Record<string, unknown>
+//   - major type 6: tag 1 epoch time (DERO DataTime)
 //   - major type 7: float16/32/64, true/false/null/undefined
 //
-// Indefinite-length and tagged values are not supported (DEROHE config forbids
-// indefinite-length and only uses one tag for time, which Arguments doesn't carry
-// through deroproof payloads).
+// Indefinite-length values and tags other than DERO's required epoch-time tag
+// are rejected.
 // ─────────────────────────────────────────────────────────────────────────────
 
 class CborReader {
@@ -183,7 +185,7 @@ class CborReader {
       case 3: {
         const len = this.readUint(extra)
         if (typeof len === 'bigint') throw new Error('cbor: text string too large')
-        return new TextDecoder('utf-8').decode(this.readBytes(len))
+        return new TextDecoder('utf-8', { fatal: true }).decode(this.readBytes(len))
       }
       case 4: {
         const len = this.readUint(extra)
@@ -195,15 +197,28 @@ class CborReader {
       case 5: {
         const len = this.readUint(extra)
         if (typeof len === 'bigint') throw new Error('cbor: map too large')
-        const map: Record<string, unknown> = {}
+        const map: Record<string, unknown> = Object.create(null) as Record<string, unknown>
         for (let i = 0; i < len; i++) {
           const k = this.read()
           if (typeof k !== 'string') {
             throw new Error(`cbor: map key must be string for DERO Arguments, got ${typeof k}`)
           }
+          if (Object.hasOwn(map, k)) throw new Error(`cbor: duplicate map key "${k}"`)
           map[k] = this.read()
         }
         return map
+      }
+      case 6: {
+        const tag = this.readUint(extra)
+        if (tag !== 1) throw new Error(`cbor: unsupported tag ${tag}`)
+        const seconds = this.read()
+        const numeric = typeof seconds === 'bigint' ? Number(seconds) : seconds
+        if (typeof numeric !== 'number' || !Number.isSafeInteger(numeric)) {
+          throw new Error('cbor: invalid epoch time')
+        }
+        const time = new Date(numeric * 1000)
+        if (Number.isNaN(time.getTime())) throw new Error('cbor: invalid epoch time')
+        return time
       }
       case 7: {
         if (extra === 20) return false
@@ -334,22 +349,29 @@ function parseArgumentEntry(rawKey: string, rawValue: unknown): ParsedArgument {
   }
   const type = rawKey[rawKey.length - 1] as DeroDataType
   const name = rawKey.slice(0, -1)
-  const typeLabel = DATA_TYPE_LABEL[type] ?? `unknown(${type})`
+  const typeLabel = DATA_TYPE_LABEL[type]
+  if (!typeLabel) throw new Error(`argument "${rawKey}" has unknown datatype "${type}"`)
   const semanticName = KNOWN_ARGUMENT_NAMES[name]
 
   let value: unknown
   switch (type) {
     case 'U': {
       // CBOR yields number or bigint; normalize to bigint so callers don't lose precision.
-      if (typeof rawValue === 'bigint') value = rawValue
-      else if (typeof rawValue === 'number') value = BigInt(rawValue)
+      let integer: bigint
+      if (typeof rawValue === 'bigint') integer = rawValue
+      else if (typeof rawValue === 'number' && Number.isSafeInteger(rawValue)) integer = BigInt(rawValue)
       else throw new Error(`argument "${rawKey}" expected uint64, got ${typeof rawValue}`)
+      if (integer < 0n || integer >= 1n << 64n) throw new Error(`argument "${rawKey}" is outside uint64 range`)
+      value = integer
       break
     }
     case 'I': {
-      if (typeof rawValue === 'bigint') value = rawValue
-      else if (typeof rawValue === 'number') value = BigInt(rawValue)
+      let integer: bigint
+      if (typeof rawValue === 'bigint') integer = rawValue
+      else if (typeof rawValue === 'number' && Number.isSafeInteger(rawValue)) integer = BigInt(rawValue)
       else throw new Error(`argument "${rawKey}" expected int64, got ${typeof rawValue}`)
+      if (integer < -(1n << 63n) || integer >= 1n << 63n) throw new Error(`argument "${rawKey}" is outside int64 range`)
+      value = integer
       break
     }
     case 'S': {
@@ -363,6 +385,7 @@ function parseArgumentEntry(rawKey: string, rawValue: unknown): ParsedArgument {
       if (!(rawValue instanceof Uint8Array)) {
         throw new Error(`argument "${rawKey}" expected byte string for hash, got ${typeof rawValue}`)
       }
+      if (rawValue.length !== 32) throw new Error(`argument "${rawKey}" expected a 32-byte hash`)
       value = bytesToHex(rawValue)
       break
     }
@@ -370,12 +393,24 @@ function parseArgumentEntry(rawKey: string, rawValue: unknown): ParsedArgument {
       if (!(rawValue instanceof Uint8Array)) {
         throw new Error(`argument "${rawKey}" expected byte string for address, got ${typeof rawValue}`)
       }
+      if (rawValue.length !== 33) throw new Error(`argument "${rawKey}" expected a 33-byte address`)
+      try {
+        deroDecompress(rawValue)
+      } catch (cause) {
+        throw new Error(`argument "${rawKey}" contains an invalid compressed address`, { cause })
+      }
       // 33-byte compressed point; surface as hex (re-encoding to bech32 needs network context).
       value = bytesToHex(rawValue)
       break
     }
+    case 'T': {
+      if (!(rawValue instanceof Date) || Number.isNaN(rawValue.getTime())) {
+        throw new Error(`argument "${rawKey}" expected tagged epoch time`)
+      }
+      value = rawValue
+      break
+    }
     case 'F':
-    case 'T':
     default:
       value = rawValue
   }
@@ -420,6 +455,11 @@ export function decodeDeroBech32(input: string): DecodedAddress {
 
   const pointBytes = new Uint8Array(body.slice(0, 33))
   const argBytes = new Uint8Array(body.slice(33))
+  try {
+    deroDecompress(pointBytes)
+  } catch (cause) {
+    throw new Error('invalid DERO compressed public key', { cause })
+  }
   const publicKeyHex = bytesToHex(pointBytes)
 
   const mainnet = hrp === 'dero' || hrp === 'deroi' || hrp === 'deroproof'
@@ -431,16 +471,17 @@ export function decodeDeroBech32(input: string): DecodedAddress {
   const args: ParsedArgument[] = []
   if (hasArguments) {
     if (argBytes.length === 0) {
-      // Some integrated addresses can carry zero-length arguments; treat as empty map.
-    } else {
-      const decoded = cborDecode(argBytes)
-      if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
-        throw new Error(`CBOR root must be a map, got ${typeof decoded}`)
-      }
-      for (const [k, v] of Object.entries(decoded as Record<string, unknown>)) {
-        args.push(parseArgumentEntry(k, v))
-      }
+      throw new Error(`${hrp} payload is missing its CBOR argument map`)
     }
+    const decoded = cborDecode(argBytes)
+    if (typeof decoded !== 'object' || decoded === null || Array.isArray(decoded)) {
+      throw new Error(`CBOR root must be a map, got ${typeof decoded}`)
+    }
+    for (const [k, v] of Object.entries(decoded as Record<string, unknown>)) {
+      args.push(parseArgumentEntry(k, v))
+    }
+  } else if (argBytes.length !== 0) {
+    throw new Error(`${hrp} addresses must not contain integrated arguments`)
   }
 
   const valueTransfer = args.find((a) => a.name === 'V' && a.type === 'U')
@@ -548,6 +589,7 @@ export type CborValue =
   | number
   | string
   | Uint8Array
+  | Date
   | boolean
   | null
   | CborValue[]
@@ -576,6 +618,11 @@ export function cborEncode(value: CborValue): Uint8Array {
 
   if (value instanceof Uint8Array) {
     return concatBytes([cborEncodeHead(2, BigInt(value.length)), value])
+  }
+
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw new Error('cborEncode: invalid Date')
+    return concatBytes([cborEncodeHead(6, 1n), cborEncode(Math.floor(value.getTime() / 1000))])
   }
 
   if (Array.isArray(value)) {
@@ -631,8 +678,13 @@ export function encodeDeroBech32(
   if (pointBytes33.length !== 33) {
     throw new Error(`encodeDeroBech32: point must be 33 bytes, got ${pointBytes33.length}`)
   }
+  try {
+    deroDecompress(pointBytes33)
+  } catch (cause) {
+    throw new Error('encodeDeroBech32: invalid DERO compressed public key', { cause })
+  }
   const wantsArgs = hrp === 'deroi' || hrp === 'detoi' || hrp === 'deroproof'
-  const argBytes = wantsArgs && args ? cborEncode(args) : new Uint8Array(0)
+  const argBytes = wantsArgs ? cborEncode(args ?? {}) : new Uint8Array(0)
 
   const body = new Uint8Array(1 + 33 + argBytes.length)
   body[0] = 1 // version

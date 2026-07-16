@@ -276,6 +276,16 @@ export const COMMAND_ITEMS = [
     source: 'builtin'
   },
   {
+    name: 'xswd',
+    command: '/xswd',
+    aliases: ['wallet-connect'],
+    description: 'Toggle or inspect the XSWD wallet bridge (Alt+X)',
+    usage: '/xswd [on|off|status]',
+    category: 'integration',
+    keywords: ['wallet', 'dero', 'engram', 'derotui', 'connect'],
+    source: 'builtin'
+  },
+  {
     name: 'config-agents',
     command: '/config-agents',
     aliases: ['agents'],

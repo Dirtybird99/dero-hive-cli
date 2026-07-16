@@ -22332,440 +22332,6 @@ function enrichWithFlaggedArtifacts(query, baseRelatedDocs) {
   return { context_note, related_docs: merged };
 }
 
-// resources/mcp/dero-mcp-server/src/proof-decode.ts
-var BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-var BECH32_CHARSET_INDEX = Object.fromEntries(
-  Array.from(BECH32_CHARSET).map((c, i) => [c, i])
-);
-function bech32Polymod(values) {
-  const generators = [996825010, 642813549, 513874426, 1027748829, 705979059];
-  let chk = 1;
-  for (const v of values) {
-    const top = chk >>> 25;
-    chk = (chk & 33554431) << 5 ^ v;
-    for (let i = 0; i < 5; i++) {
-      if (top >>> i & 1) chk ^= generators[i];
-    }
-  }
-  return chk;
-}
-function bech32HrpExpand(hrp) {
-  const out = [];
-  for (let i = 0; i < hrp.length; i++) out.push(hrp.charCodeAt(i) >>> 5);
-  out.push(0);
-  for (let i = 0; i < hrp.length; i++) out.push(hrp.charCodeAt(i) & 31);
-  return out;
-}
-function bech32VerifyChecksum(hrp, data) {
-  return bech32Polymod([...bech32HrpExpand(hrp), ...data]) === 1;
-}
-function bech32Decode(input) {
-  if (input.length < 8 || input.length > 1023) {
-    throw new Error(`bech32: invalid length ${input.length}`);
-  }
-  const hasLower = /[a-z]/.test(input);
-  const hasUpper = /[A-Z]/.test(input);
-  if (hasLower && hasUpper) throw new Error("bech32: mixed case not allowed");
-  const lower = input.toLowerCase();
-  const sep = lower.lastIndexOf("1");
-  if (sep < 1 || sep + 7 > lower.length) {
-    throw new Error("bech32: separator not found or too close to ends");
-  }
-  const hrp = lower.slice(0, sep);
-  const dataPart = lower.slice(sep + 1);
-  const data = [];
-  for (const ch of dataPart) {
-    const v = BECH32_CHARSET_INDEX[ch];
-    if (v === void 0) throw new Error(`bech32: invalid char "${ch}"`);
-    data.push(v);
-  }
-  if (!bech32VerifyChecksum(hrp, data)) {
-    throw new Error("bech32: invalid checksum");
-  }
-  return { hrp, data: data.slice(0, -6) };
-}
-function convertBits(data, fromBits, toBits, pad) {
-  let acc = 0;
-  let bits = 0;
-  const out = [];
-  const maxv = (1 << toBits) - 1;
-  for (const value of data) {
-    if (value < 0 || value >>> fromBits !== 0) {
-      throw new Error(`convertBits: value out of range: ${value}`);
-    }
-    acc = acc << fromBits | value;
-    bits += fromBits;
-    while (bits >= toBits) {
-      bits -= toBits;
-      out.push(acc >>> bits & maxv);
-    }
-  }
-  if (pad) {
-    if (bits > 0) out.push(acc << toBits - bits & maxv);
-  } else if (bits >= fromBits || (acc << toBits - bits & maxv) !== 0) {
-    throw new Error("convertBits: non-zero padding bits");
-  }
-  return out;
-}
-var CborReader = class {
-  constructor(bytes) {
-    this.bytes = bytes;
-  }
-  bytes;
-  offset = 0;
-  readByte() {
-    if (this.offset >= this.bytes.length) throw new Error("cbor: unexpected EOF");
-    return this.bytes[this.offset++];
-  }
-  readUint(extra) {
-    if (extra < 24) return extra;
-    if (extra === 24) return this.readByte();
-    if (extra === 25) return this.readByte() << 8 | this.readByte();
-    if (extra === 26) {
-      const a = this.readByte(), b = this.readByte(), c = this.readByte(), d = this.readByte();
-      return a * 16777216 + (b << 16 | c << 8 | d);
-    }
-    if (extra === 27) {
-      let v = 0n;
-      for (let i = 0; i < 8; i++) v = v << 8n | BigInt(this.readByte());
-      return v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v;
-    }
-    throw new Error(`cbor: unsupported additional info ${extra}`);
-  }
-  readBytes(len) {
-    if (this.offset + len > this.bytes.length) throw new Error("cbor: truncated byte string");
-    const out = this.bytes.slice(this.offset, this.offset + len);
-    this.offset += len;
-    return out;
-  }
-  read() {
-    const initial = this.readByte();
-    const major = initial >>> 5;
-    const extra = initial & 31;
-    switch (major) {
-      case 0:
-        return this.readUint(extra);
-      case 1: {
-        const u = this.readUint(extra);
-        if (typeof u === "bigint") return -1n - u;
-        return -1 - u;
-      }
-      case 2: {
-        const len = this.readUint(extra);
-        if (typeof len === "bigint") throw new Error("cbor: byte string too large");
-        return this.readBytes(len);
-      }
-      case 3: {
-        const len = this.readUint(extra);
-        if (typeof len === "bigint") throw new Error("cbor: text string too large");
-        return new TextDecoder("utf-8").decode(this.readBytes(len));
-      }
-      case 4: {
-        const len = this.readUint(extra);
-        if (typeof len === "bigint") throw new Error("cbor: array too large");
-        const arr = [];
-        for (let i = 0; i < len; i++) arr.push(this.read());
-        return arr;
-      }
-      case 5: {
-        const len = this.readUint(extra);
-        if (typeof len === "bigint") throw new Error("cbor: map too large");
-        const map = {};
-        for (let i = 0; i < len; i++) {
-          const k = this.read();
-          if (typeof k !== "string") {
-            throw new Error(`cbor: map key must be string for DERO Arguments, got ${typeof k}`);
-          }
-          map[k] = this.read();
-        }
-        return map;
-      }
-      case 7: {
-        if (extra === 20) return false;
-        if (extra === 21) return true;
-        if (extra === 22) return null;
-        if (extra === 23) return void 0;
-        throw new Error(`cbor: unsupported simple/float type (extra=${extra})`);
-      }
-      default:
-        throw new Error(`cbor: unsupported major type ${major}`);
-    }
-  }
-  done() {
-    return this.offset >= this.bytes.length;
-  }
-};
-function cborDecode(bytes) {
-  const r = new CborReader(bytes);
-  const v = r.read();
-  if (!r.done()) throw new Error("cbor: trailing bytes after root value");
-  return v;
-}
-var DATA_TYPE_LABEL = {
-  I: "int64",
-  U: "uint64",
-  S: "string",
-  H: "hash (32 bytes)",
-  A: "address (33-byte compressed point)",
-  F: "float64",
-  T: "time"
-};
-var KNOWN_ARGUMENT_NAMES = {
-  V: "RPC_VALUE_TRANSFER",
-  S: "RPC_SOURCE_PORT",
-  D: "RPC_DESTINATION_PORT",
-  C: "RPC_COMMENT",
-  N: "RPC_NEEDED_REPLY_BACK",
-  E: "RPC_EXPIRY",
-  R: "RPC_REPLYBACK_ADDRESS",
-  T: "RPC_TRANSACTION_REASON"
-};
-var UINT64_MAX = (1n << 64n) - 1n;
-var UINT64_SIGN_BIT = 1n << 63n;
-function interpretValueTransfer(value) {
-  if (value < 0n || value > UINT64_MAX) {
-    throw new Error(`uint64 out of range: ${value}`);
-  }
-  const isNegative = (value & UINT64_SIGN_BIT) !== 0n;
-  const signedAtoms = isNegative ? value - (1n << 64n) : value;
-  const ATOMIC2 = 100000n;
-  const abs = signedAtoms < 0n ? -signedAtoms : signedAtoms;
-  const whole = abs / ATOMIC2;
-  const frac = abs % ATOMIC2;
-  const sign = signedAtoms < 0n ? "-" : "";
-  const dero = `${sign}${whole.toString()}.${frac.toString().padStart(5, "0")}`;
-  return {
-    uint64: value.toString(),
-    signed_int64: signedAtoms.toString(),
-    is_negative_wraparound: isNegative,
-    signed_atoms: signedAtoms.toString(),
-    dero
-  };
-}
-function parseArgumentEntry(rawKey, rawValue) {
-  if (rawKey.length < 2) {
-    throw new Error(`invalid argument key "${rawKey}" (must be \u22652 chars: name + type)`);
-  }
-  const type = rawKey[rawKey.length - 1];
-  const name = rawKey.slice(0, -1);
-  const typeLabel = DATA_TYPE_LABEL[type] ?? `unknown(${type})`;
-  const semanticName = KNOWN_ARGUMENT_NAMES[name];
-  let value;
-  switch (type) {
-    case "U": {
-      if (typeof rawValue === "bigint") value = rawValue;
-      else if (typeof rawValue === "number") value = BigInt(rawValue);
-      else throw new Error(`argument "${rawKey}" expected uint64, got ${typeof rawValue}`);
-      break;
-    }
-    case "I": {
-      if (typeof rawValue === "bigint") value = rawValue;
-      else if (typeof rawValue === "number") value = BigInt(rawValue);
-      else throw new Error(`argument "${rawKey}" expected int64, got ${typeof rawValue}`);
-      break;
-    }
-    case "S": {
-      if (typeof rawValue !== "string") {
-        throw new Error(`argument "${rawKey}" expected string, got ${typeof rawValue}`);
-      }
-      value = rawValue;
-      break;
-    }
-    case "H": {
-      if (!(rawValue instanceof Uint8Array)) {
-        throw new Error(`argument "${rawKey}" expected byte string for hash, got ${typeof rawValue}`);
-      }
-      value = bytesToHex(rawValue);
-      break;
-    }
-    case "A": {
-      if (!(rawValue instanceof Uint8Array)) {
-        throw new Error(`argument "${rawKey}" expected byte string for address, got ${typeof rawValue}`);
-      }
-      value = bytesToHex(rawValue);
-      break;
-    }
-    case "F":
-    case "T":
-    default:
-      value = rawValue;
-  }
-  return {
-    name,
-    type,
-    type_label: typeLabel,
-    ...semanticName ? { semantic_name: semanticName } : {},
-    value: typeof value === "bigint" ? value.toString() : value
-  };
-}
-function bytesToHex(bytes) {
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
-}
-function decodeDeroBech32(input) {
-  const { hrp, data } = bech32Decode(input.trim());
-  const validHrps = ["dero", "deto", "deroi", "detoi", "deroproof"];
-  if (!validHrps.includes(hrp)) {
-    throw new Error(`invalid HRP "${hrp}" (expected one of ${validHrps.join(", ")})`);
-  }
-  const repacked = convertBits(data, 5, 8, false);
-  if (repacked.length < 1) throw new Error("decoded payload too short for version byte");
-  if (repacked[0] !== 1) throw new Error(`invalid address version: ${repacked[0]} (expected 1)`);
-  const body = repacked.slice(1);
-  if (body.length < 33) {
-    throw new Error(`decoded payload too short for compressed point: ${body.length} < 33 bytes`);
-  }
-  const pointBytes = new Uint8Array(body.slice(0, 33));
-  const argBytes = new Uint8Array(body.slice(33));
-  const publicKeyHex = bytesToHex(pointBytes);
-  const mainnet = hrp === "dero" || hrp === "deroi" || hrp === "deroproof";
-  const isProof = hrp === "deroproof";
-  const hasArguments = hrp === "deroi" || hrp === "detoi" || hrp === "deroproof";
-  const args = [];
-  if (hasArguments) {
-    if (argBytes.length === 0) {
-    } else {
-      const decoded = cborDecode(argBytes);
-      if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
-        throw new Error(`CBOR root must be a map, got ${typeof decoded}`);
-      }
-      for (const [k, v] of Object.entries(decoded)) {
-        args.push(parseArgumentEntry(k, v));
-      }
-    }
-  }
-  const valueTransfer = args.find((a) => a.name === "V" && a.type === "U");
-  return {
-    hrp,
-    mainnet,
-    is_proof: isProof,
-    public_key_hex: publicKeyHex,
-    arguments: args,
-    ...valueTransfer ? { value_transfer_uint64: BigInt(valueTransfer.value) } : {}
-  };
-}
-function bech32CreateChecksum(hrp, data) {
-  const values = [...bech32HrpExpand(hrp), ...data, 0, 0, 0, 0, 0, 0];
-  const polymod = bech32Polymod(values) ^ 1;
-  const out = [];
-  for (let i = 0; i < 6; i++) out.push(polymod >>> 5 * (5 - i) & 31);
-  return out;
-}
-function bech32Encode(hrp, data) {
-  const checksum = bech32CreateChecksum(hrp, data);
-  const combined = [...data, ...checksum];
-  let out = hrp + "1";
-  for (const v of combined) {
-    if (v < 0 || v >= 32) throw new Error(`bech32Encode: value out of range ${v}`);
-    out += BECH32_CHARSET[v];
-  }
-  return out;
-}
-function cborEncodeHead(major, value) {
-  const mt = major << 5;
-  if (value < 0n) throw new Error(`cborEncodeHead: negative value ${value}`);
-  if (value < 24n) return new Uint8Array([mt | Number(value)]);
-  if (value < 1n << 8n) return new Uint8Array([mt | 24, Number(value)]);
-  if (value < 1n << 16n) {
-    const v = Number(value);
-    return new Uint8Array([mt | 25, v >>> 8 & 255, v & 255]);
-  }
-  if (value < 1n << 32n) {
-    const v = Number(value);
-    return new Uint8Array([mt | 26, v >>> 24 & 255, v >>> 16 & 255, v >>> 8 & 255, v & 255]);
-  }
-  if (value < 1n << 64n) {
-    const out = new Uint8Array(9);
-    out[0] = mt | 27;
-    let v = value;
-    for (let i = 8; i >= 1; i--) {
-      out[i] = Number(v & 0xffn);
-      v >>= 8n;
-    }
-    return out;
-  }
-  throw new Error(`cborEncodeHead: value out of uint64 range ${value}`);
-}
-function concatBytes(parts) {
-  let total = 0;
-  for (const p of parts) total += p.length;
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const p of parts) {
-    out.set(p, offset);
-    offset += p.length;
-  }
-  return out;
-}
-function compareCanonicalKeys(a, b) {
-  if (a.length !== b.length) return a.length - b.length;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return a[i] - b[i];
-  }
-  return 0;
-}
-function cborEncode(value) {
-  if (value === null) return new Uint8Array([246]);
-  if (value === true) return new Uint8Array([245]);
-  if (value === false) return new Uint8Array([244]);
-  if (typeof value === "bigint" || typeof value === "number") {
-    const big = typeof value === "bigint" ? value : BigInt(value);
-    if (big < 0n) {
-      const n = -1n - big;
-      return cborEncodeHead(1, n);
-    }
-    return cborEncodeHead(0, big);
-  }
-  if (typeof value === "string") {
-    const utf8 = new TextEncoder().encode(value);
-    return concatBytes([cborEncodeHead(3, BigInt(utf8.length)), utf8]);
-  }
-  if (value instanceof Uint8Array) {
-    return concatBytes([cborEncodeHead(2, BigInt(value.length)), value]);
-  }
-  if (Array.isArray(value)) {
-    const parts = [cborEncodeHead(4, BigInt(value.length))];
-    for (const item of value) parts.push(cborEncode(item));
-    return concatBytes(parts);
-  }
-  if (typeof value === "object") {
-    const entries = Object.entries(value).map(
-      ([k, v]) => [cborEncode(k), cborEncode(v)]
-    );
-    entries.sort((a, b) => compareCanonicalKeys(a[0], b[0]));
-    const parts = [cborEncodeHead(5, BigInt(entries.length))];
-    for (const [k, v] of entries) {
-      parts.push(k);
-      parts.push(v);
-    }
-    return concatBytes(parts);
-  }
-  throw new Error(`cborEncode: unsupported value type ${typeof value}`);
-}
-function encodeDeroBech32(hrp, pointBytes33, args) {
-  if (pointBytes33.length !== 33) {
-    throw new Error(`encodeDeroBech32: point must be 33 bytes, got ${pointBytes33.length}`);
-  }
-  const wantsArgs = hrp === "deroi" || hrp === "detoi" || hrp === "deroproof";
-  const argBytes = wantsArgs && args ? cborEncode(args) : new Uint8Array(0);
-  const body = new Uint8Array(1 + 33 + argBytes.length);
-  body[0] = 1;
-  body.set(pointBytes33, 1);
-  body.set(argBytes, 34);
-  const data5 = convertBits(Array.from(body), 8, 5, true);
-  return bech32Encode(hrp, data5);
-}
-function encodeForgeProofString(blinderCompressed33, amountUint64, hrp = "deroproof") {
-  if (amountUint64 < 0n || amountUint64 >= 1n << 64n) {
-    throw new Error(`encodeForgeProofString: amount out of uint64 range ${amountUint64}`);
-  }
-  return encodeDeroBech32(hrp, blinderCompressed33, {
-    HH: new Uint8Array(32),
-    VU: amountUint64
-  });
-}
-
 // node_modules/@noble/hashes/utils.js
 function isBytes(a) {
   return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === "Uint8Array" && "BYTES_PER_ELEMENT" in a && a.BYTES_PER_ELEMENT === 1;
@@ -22800,7 +22366,7 @@ var hasHexBuiltin = /* @__PURE__ */ (() => (
   typeof Uint8Array.from([]).toHex === "function" && typeof Uint8Array.fromHex === "function"
 ))();
 var hexes = /* @__PURE__ */ Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
-function bytesToHex2(bytes) {
+function bytesToHex(bytes) {
   abytes(bytes);
   if (hasHexBuiltin)
     return bytes.toHex();
@@ -22848,7 +22414,7 @@ function hexToBytes(hex) {
   }
   return array2;
 }
-function concatBytes2(...arrays) {
+function concatBytes(...arrays) {
   let sum = 0;
   for (let i = 0; i < arrays.length; i++) {
     const a = arrays[i];
@@ -22876,8 +22442,8 @@ function randomBytes(bytesLength = 32) {
 // node_modules/@noble/curves/utils.js
 var abytes2 = (value, length, title) => abytes(value, length, title);
 var anumber2 = anumber;
-var bytesToHex3 = bytesToHex2;
-var concatBytes3 = (...arrays) => concatBytes2(...arrays);
+var bytesToHex2 = bytesToHex;
+var concatBytes2 = (...arrays) => concatBytes(...arrays);
 var hexToBytes2 = (hex) => hexToBytes(hex);
 var randomBytes2 = (bytesLength) => randomBytes(bytesLength);
 var _0n = /* @__PURE__ */ BigInt(0);
@@ -22917,10 +22483,10 @@ function hexToNumber(hex) {
   return hex === "" ? _0n : BigInt("0x" + hex);
 }
 function bytesToNumberBE(bytes) {
-  return hexToNumber(bytesToHex2(bytes));
+  return hexToNumber(bytesToHex(bytes));
 }
 function bytesToNumberLE(bytes) {
-  return hexToNumber(bytesToHex2(copyBytes(abytes(bytes)).reverse()));
+  return hexToNumber(bytesToHex(copyBytes(abytes(bytes)).reverse()));
 }
 function numberToBytesBE(n, len) {
   anumber(len);
@@ -23786,9 +23352,9 @@ function weierstrass(params, extraOpts = {}) {
     if (isCompressed) {
       assertCompressionIsSupported();
       const hasEvenY = !Fp4.isOdd(y);
-      return concatBytes3(pprefix(hasEvenY), bx);
+      return concatBytes2(pprefix(hasEvenY), bx);
     } else {
-      return concatBytes3(Uint8Array.of(4), bx, Fp4.toBytes(y));
+      return concatBytes2(Uint8Array.of(4), bx, Fp4.toBytes(y));
     }
   }
   function pointFromBytes(bytes) {
@@ -24171,7 +23737,7 @@ function weierstrass(params, extraOpts = {}) {
       return encodePoint(Point2, this, isCompressed);
     }
     toHex(isCompressed = true) {
-      return bytesToHex3(this.toBytes(isCompressed));
+      return bytesToHex2(this.toBytes(isCompressed));
     }
     toString() {
       return `<Point ${this.is0() ? "ZERO" : this.toHex()}>`;
@@ -24600,7 +24166,7 @@ var _Field2 = class {
     });
   }
   toBytes({ c0, c1 }) {
-    return concatBytes3(this.Fp.toBytes(c0), this.Fp.toBytes(c1));
+    return concatBytes2(this.Fp.toBytes(c0), this.Fp.toBytes(c1));
   }
   cmov({ c0, c1 }, { c0: r0, c1: r1 }, c) {
     const { Fp: Fp4 } = this;
@@ -24807,7 +24373,7 @@ var _Field6 = class {
   }
   toBytes({ c0, c1, c2 }) {
     const { Fp2: Fp22 } = this;
-    return concatBytes3(Fp22.toBytes(c0), Fp22.toBytes(c1), Fp22.toBytes(c2));
+    return concatBytes2(Fp22.toBytes(c0), Fp22.toBytes(c1), Fp22.toBytes(c2));
   }
   cmov({ c0, c1, c2 }, { c0: r0, c1: r1, c2: r2 }, c) {
     const { Fp2: Fp22 } = this;
@@ -25033,7 +24599,7 @@ var _Field12 = class {
   }
   toBytes({ c0, c1 }) {
     const { Fp6 } = this;
-    return concatBytes3(Fp6.toBytes(c0), Fp6.toBytes(c1));
+    return concatBytes2(Fp6.toBytes(c0), Fp6.toBytes(c1));
   }
   cmov({ c0, c1 }, { c0: r0, c1: r1 }, c) {
     const { Fp6 } = this;
@@ -25320,7 +24886,7 @@ function hexToBytes3(hex) {
   }
   return out;
 }
-function bytesToHex4(bytes) {
+function bytesToHex3(bytes) {
   let hex = "";
   for (const b of bytes) hex += b.toString(16).padStart(2, "0");
   return hex;
@@ -25376,7 +24942,7 @@ function deroDecompressHex(hex) {
   return deroDecompress(hexToBytes3(hex));
 }
 function deroCompressHex(point) {
-  return bytesToHex4(deroCompress(point));
+  return bytesToHex3(deroCompress(point));
 }
 var G = deroDecompressHex(DERO_G_COMPRESSED_HEX);
 function scalarMult(point, scalar) {
@@ -25400,6 +24966,489 @@ function negate(point) {
 }
 function pointsEqual(a, b) {
   return a.equals(b);
+}
+
+// resources/mcp/dero-mcp-server/src/proof-decode.ts
+var BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+var BECH32_CHARSET_INDEX = Object.fromEntries(
+  Array.from(BECH32_CHARSET).map((c, i) => [c, i])
+);
+function bech32Polymod(values) {
+  const generators = [996825010, 642813549, 513874426, 1027748829, 705979059];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >>> 25;
+    chk = (chk & 33554431) << 5 ^ v;
+    for (let i = 0; i < 5; i++) {
+      if (top >>> i & 1) chk ^= generators[i];
+    }
+  }
+  return chk;
+}
+function bech32HrpExpand(hrp) {
+  const out = [];
+  for (let i = 0; i < hrp.length; i++) out.push(hrp.charCodeAt(i) >>> 5);
+  out.push(0);
+  for (let i = 0; i < hrp.length; i++) out.push(hrp.charCodeAt(i) & 31);
+  return out;
+}
+function bech32VerifyChecksum(hrp, data) {
+  return bech32Polymod([...bech32HrpExpand(hrp), ...data]) === 1;
+}
+function bech32Decode(input) {
+  if (input.length < 8 || input.length > 1023) {
+    throw new Error(`bech32: invalid length ${input.length}`);
+  }
+  const hasLower = /[a-z]/.test(input);
+  const hasUpper = /[A-Z]/.test(input);
+  if (hasLower && hasUpper) throw new Error("bech32: mixed case not allowed");
+  const lower = input.toLowerCase();
+  const sep = lower.lastIndexOf("1");
+  if (sep < 1 || sep + 7 > lower.length) {
+    throw new Error("bech32: separator not found or too close to ends");
+  }
+  const hrp = lower.slice(0, sep);
+  const dataPart = lower.slice(sep + 1);
+  const data = [];
+  for (const ch of dataPart) {
+    const v = BECH32_CHARSET_INDEX[ch];
+    if (v === void 0) throw new Error(`bech32: invalid char "${ch}"`);
+    data.push(v);
+  }
+  if (!bech32VerifyChecksum(hrp, data)) {
+    throw new Error("bech32: invalid checksum");
+  }
+  return { hrp, data: data.slice(0, -6) };
+}
+function convertBits(data, fromBits, toBits, pad) {
+  let acc = 0;
+  let bits = 0;
+  const out = [];
+  const maxv = (1 << toBits) - 1;
+  for (const value of data) {
+    if (value < 0 || value >>> fromBits !== 0) {
+      throw new Error(`convertBits: value out of range: ${value}`);
+    }
+    acc = acc << fromBits | value;
+    bits += fromBits;
+    while (bits >= toBits) {
+      bits -= toBits;
+      out.push(acc >>> bits & maxv);
+    }
+  }
+  if (pad) {
+    if (bits > 0) out.push(acc << toBits - bits & maxv);
+  } else if (bits >= fromBits || (acc << toBits - bits & maxv) !== 0) {
+    throw new Error("convertBits: non-zero padding bits");
+  }
+  return out;
+}
+var CborReader = class {
+  constructor(bytes) {
+    this.bytes = bytes;
+  }
+  bytes;
+  offset = 0;
+  readByte() {
+    if (this.offset >= this.bytes.length) throw new Error("cbor: unexpected EOF");
+    return this.bytes[this.offset++];
+  }
+  readUint(extra) {
+    if (extra < 24) return extra;
+    if (extra === 24) return this.readByte();
+    if (extra === 25) return this.readByte() << 8 | this.readByte();
+    if (extra === 26) {
+      const a = this.readByte(), b = this.readByte(), c = this.readByte(), d = this.readByte();
+      return a * 16777216 + (b << 16 | c << 8 | d);
+    }
+    if (extra === 27) {
+      let v = 0n;
+      for (let i = 0; i < 8; i++) v = v << 8n | BigInt(this.readByte());
+      return v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v;
+    }
+    throw new Error(`cbor: unsupported additional info ${extra}`);
+  }
+  readBytes(len) {
+    if (this.offset + len > this.bytes.length) throw new Error("cbor: truncated byte string");
+    const out = this.bytes.slice(this.offset, this.offset + len);
+    this.offset += len;
+    return out;
+  }
+  read() {
+    const initial = this.readByte();
+    const major = initial >>> 5;
+    const extra = initial & 31;
+    switch (major) {
+      case 0:
+        return this.readUint(extra);
+      case 1: {
+        const u = this.readUint(extra);
+        if (typeof u === "bigint") return -1n - u;
+        return -1 - u;
+      }
+      case 2: {
+        const len = this.readUint(extra);
+        if (typeof len === "bigint") throw new Error("cbor: byte string too large");
+        return this.readBytes(len);
+      }
+      case 3: {
+        const len = this.readUint(extra);
+        if (typeof len === "bigint") throw new Error("cbor: text string too large");
+        return new TextDecoder("utf-8", { fatal: true }).decode(this.readBytes(len));
+      }
+      case 4: {
+        const len = this.readUint(extra);
+        if (typeof len === "bigint") throw new Error("cbor: array too large");
+        const arr = [];
+        for (let i = 0; i < len; i++) arr.push(this.read());
+        return arr;
+      }
+      case 5: {
+        const len = this.readUint(extra);
+        if (typeof len === "bigint") throw new Error("cbor: map too large");
+        const map = /* @__PURE__ */ Object.create(null);
+        for (let i = 0; i < len; i++) {
+          const k = this.read();
+          if (typeof k !== "string") {
+            throw new Error(`cbor: map key must be string for DERO Arguments, got ${typeof k}`);
+          }
+          if (Object.hasOwn(map, k)) throw new Error(`cbor: duplicate map key "${k}"`);
+          map[k] = this.read();
+        }
+        return map;
+      }
+      case 6: {
+        const tag = this.readUint(extra);
+        if (tag !== 1) throw new Error(`cbor: unsupported tag ${tag}`);
+        const seconds = this.read();
+        const numeric = typeof seconds === "bigint" ? Number(seconds) : seconds;
+        if (typeof numeric !== "number" || !Number.isSafeInteger(numeric)) {
+          throw new Error("cbor: invalid epoch time");
+        }
+        const time3 = new Date(numeric * 1e3);
+        if (Number.isNaN(time3.getTime())) throw new Error("cbor: invalid epoch time");
+        return time3;
+      }
+      case 7: {
+        if (extra === 20) return false;
+        if (extra === 21) return true;
+        if (extra === 22) return null;
+        if (extra === 23) return void 0;
+        throw new Error(`cbor: unsupported simple/float type (extra=${extra})`);
+      }
+      default:
+        throw new Error(`cbor: unsupported major type ${major}`);
+    }
+  }
+  done() {
+    return this.offset >= this.bytes.length;
+  }
+};
+function cborDecode(bytes) {
+  const r = new CborReader(bytes);
+  const v = r.read();
+  if (!r.done()) throw new Error("cbor: trailing bytes after root value");
+  return v;
+}
+var DATA_TYPE_LABEL = {
+  I: "int64",
+  U: "uint64",
+  S: "string",
+  H: "hash (32 bytes)",
+  A: "address (33-byte compressed point)",
+  F: "float64",
+  T: "time"
+};
+var KNOWN_ARGUMENT_NAMES = {
+  V: "RPC_VALUE_TRANSFER",
+  S: "RPC_SOURCE_PORT",
+  D: "RPC_DESTINATION_PORT",
+  C: "RPC_COMMENT",
+  N: "RPC_NEEDED_REPLY_BACK",
+  E: "RPC_EXPIRY",
+  R: "RPC_REPLYBACK_ADDRESS",
+  T: "RPC_TRANSACTION_REASON"
+};
+var UINT64_MAX = (1n << 64n) - 1n;
+var UINT64_SIGN_BIT = 1n << 63n;
+function interpretValueTransfer(value) {
+  if (value < 0n || value > UINT64_MAX) {
+    throw new Error(`uint64 out of range: ${value}`);
+  }
+  const isNegative = (value & UINT64_SIGN_BIT) !== 0n;
+  const signedAtoms = isNegative ? value - (1n << 64n) : value;
+  const ATOMIC2 = 100000n;
+  const abs = signedAtoms < 0n ? -signedAtoms : signedAtoms;
+  const whole = abs / ATOMIC2;
+  const frac = abs % ATOMIC2;
+  const sign = signedAtoms < 0n ? "-" : "";
+  const dero = `${sign}${whole.toString()}.${frac.toString().padStart(5, "0")}`;
+  return {
+    uint64: value.toString(),
+    signed_int64: signedAtoms.toString(),
+    is_negative_wraparound: isNegative,
+    signed_atoms: signedAtoms.toString(),
+    dero
+  };
+}
+function parseArgumentEntry(rawKey, rawValue) {
+  if (rawKey.length < 2) {
+    throw new Error(`invalid argument key "${rawKey}" (must be \u22652 chars: name + type)`);
+  }
+  const type = rawKey[rawKey.length - 1];
+  const name = rawKey.slice(0, -1);
+  const typeLabel = DATA_TYPE_LABEL[type];
+  if (!typeLabel) throw new Error(`argument "${rawKey}" has unknown datatype "${type}"`);
+  const semanticName = KNOWN_ARGUMENT_NAMES[name];
+  let value;
+  switch (type) {
+    case "U": {
+      let integer2;
+      if (typeof rawValue === "bigint") integer2 = rawValue;
+      else if (typeof rawValue === "number" && Number.isSafeInteger(rawValue)) integer2 = BigInt(rawValue);
+      else throw new Error(`argument "${rawKey}" expected uint64, got ${typeof rawValue}`);
+      if (integer2 < 0n || integer2 >= 1n << 64n) throw new Error(`argument "${rawKey}" is outside uint64 range`);
+      value = integer2;
+      break;
+    }
+    case "I": {
+      let integer2;
+      if (typeof rawValue === "bigint") integer2 = rawValue;
+      else if (typeof rawValue === "number" && Number.isSafeInteger(rawValue)) integer2 = BigInt(rawValue);
+      else throw new Error(`argument "${rawKey}" expected int64, got ${typeof rawValue}`);
+      if (integer2 < -(1n << 63n) || integer2 >= 1n << 63n) throw new Error(`argument "${rawKey}" is outside int64 range`);
+      value = integer2;
+      break;
+    }
+    case "S": {
+      if (typeof rawValue !== "string") {
+        throw new Error(`argument "${rawKey}" expected string, got ${typeof rawValue}`);
+      }
+      value = rawValue;
+      break;
+    }
+    case "H": {
+      if (!(rawValue instanceof Uint8Array)) {
+        throw new Error(`argument "${rawKey}" expected byte string for hash, got ${typeof rawValue}`);
+      }
+      if (rawValue.length !== 32) throw new Error(`argument "${rawKey}" expected a 32-byte hash`);
+      value = bytesToHex4(rawValue);
+      break;
+    }
+    case "A": {
+      if (!(rawValue instanceof Uint8Array)) {
+        throw new Error(`argument "${rawKey}" expected byte string for address, got ${typeof rawValue}`);
+      }
+      if (rawValue.length !== 33) throw new Error(`argument "${rawKey}" expected a 33-byte address`);
+      try {
+        deroDecompress(rawValue);
+      } catch (cause) {
+        throw new Error(`argument "${rawKey}" contains an invalid compressed address`, { cause });
+      }
+      value = bytesToHex4(rawValue);
+      break;
+    }
+    case "T": {
+      if (!(rawValue instanceof Date) || Number.isNaN(rawValue.getTime())) {
+        throw new Error(`argument "${rawKey}" expected tagged epoch time`);
+      }
+      value = rawValue;
+      break;
+    }
+    case "F":
+    default:
+      value = rawValue;
+  }
+  return {
+    name,
+    type,
+    type_label: typeLabel,
+    ...semanticName ? { semantic_name: semanticName } : {},
+    value: typeof value === "bigint" ? value.toString() : value
+  };
+}
+function bytesToHex4(bytes) {
+  let hex = "";
+  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+  return hex;
+}
+function decodeDeroBech32(input) {
+  const { hrp, data } = bech32Decode(input.trim());
+  const validHrps = ["dero", "deto", "deroi", "detoi", "deroproof"];
+  if (!validHrps.includes(hrp)) {
+    throw new Error(`invalid HRP "${hrp}" (expected one of ${validHrps.join(", ")})`);
+  }
+  const repacked = convertBits(data, 5, 8, false);
+  if (repacked.length < 1) throw new Error("decoded payload too short for version byte");
+  if (repacked[0] !== 1) throw new Error(`invalid address version: ${repacked[0]} (expected 1)`);
+  const body = repacked.slice(1);
+  if (body.length < 33) {
+    throw new Error(`decoded payload too short for compressed point: ${body.length} < 33 bytes`);
+  }
+  const pointBytes = new Uint8Array(body.slice(0, 33));
+  const argBytes = new Uint8Array(body.slice(33));
+  try {
+    deroDecompress(pointBytes);
+  } catch (cause) {
+    throw new Error("invalid DERO compressed public key", { cause });
+  }
+  const publicKeyHex = bytesToHex4(pointBytes);
+  const mainnet = hrp === "dero" || hrp === "deroi" || hrp === "deroproof";
+  const isProof = hrp === "deroproof";
+  const hasArguments = hrp === "deroi" || hrp === "detoi" || hrp === "deroproof";
+  const args = [];
+  if (hasArguments) {
+    if (argBytes.length === 0) {
+      throw new Error(`${hrp} payload is missing its CBOR argument map`);
+    }
+    const decoded = cborDecode(argBytes);
+    if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
+      throw new Error(`CBOR root must be a map, got ${typeof decoded}`);
+    }
+    for (const [k, v] of Object.entries(decoded)) {
+      args.push(parseArgumentEntry(k, v));
+    }
+  } else if (argBytes.length !== 0) {
+    throw new Error(`${hrp} addresses must not contain integrated arguments`);
+  }
+  const valueTransfer = args.find((a) => a.name === "V" && a.type === "U");
+  return {
+    hrp,
+    mainnet,
+    is_proof: isProof,
+    public_key_hex: publicKeyHex,
+    arguments: args,
+    ...valueTransfer ? { value_transfer_uint64: BigInt(valueTransfer.value) } : {}
+  };
+}
+function bech32CreateChecksum(hrp, data) {
+  const values = [...bech32HrpExpand(hrp), ...data, 0, 0, 0, 0, 0, 0];
+  const polymod = bech32Polymod(values) ^ 1;
+  const out = [];
+  for (let i = 0; i < 6; i++) out.push(polymod >>> 5 * (5 - i) & 31);
+  return out;
+}
+function bech32Encode(hrp, data) {
+  const checksum = bech32CreateChecksum(hrp, data);
+  const combined = [...data, ...checksum];
+  let out = hrp + "1";
+  for (const v of combined) {
+    if (v < 0 || v >= 32) throw new Error(`bech32Encode: value out of range ${v}`);
+    out += BECH32_CHARSET[v];
+  }
+  return out;
+}
+function cborEncodeHead(major, value) {
+  const mt = major << 5;
+  if (value < 0n) throw new Error(`cborEncodeHead: negative value ${value}`);
+  if (value < 24n) return new Uint8Array([mt | Number(value)]);
+  if (value < 1n << 8n) return new Uint8Array([mt | 24, Number(value)]);
+  if (value < 1n << 16n) {
+    const v = Number(value);
+    return new Uint8Array([mt | 25, v >>> 8 & 255, v & 255]);
+  }
+  if (value < 1n << 32n) {
+    const v = Number(value);
+    return new Uint8Array([mt | 26, v >>> 24 & 255, v >>> 16 & 255, v >>> 8 & 255, v & 255]);
+  }
+  if (value < 1n << 64n) {
+    const out = new Uint8Array(9);
+    out[0] = mt | 27;
+    let v = value;
+    for (let i = 8; i >= 1; i--) {
+      out[i] = Number(v & 0xffn);
+      v >>= 8n;
+    }
+    return out;
+  }
+  throw new Error(`cborEncodeHead: value out of uint64 range ${value}`);
+}
+function concatBytes3(parts) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+function compareCanonicalKeys(a, b) {
+  if (a.length !== b.length) return a.length - b.length;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+function cborEncode(value) {
+  if (value === null) return new Uint8Array([246]);
+  if (value === true) return new Uint8Array([245]);
+  if (value === false) return new Uint8Array([244]);
+  if (typeof value === "bigint" || typeof value === "number") {
+    const big = typeof value === "bigint" ? value : BigInt(value);
+    if (big < 0n) {
+      const n = -1n - big;
+      return cborEncodeHead(1, n);
+    }
+    return cborEncodeHead(0, big);
+  }
+  if (typeof value === "string") {
+    const utf8 = new TextEncoder().encode(value);
+    return concatBytes3([cborEncodeHead(3, BigInt(utf8.length)), utf8]);
+  }
+  if (value instanceof Uint8Array) {
+    return concatBytes3([cborEncodeHead(2, BigInt(value.length)), value]);
+  }
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw new Error("cborEncode: invalid Date");
+    return concatBytes3([cborEncodeHead(6, 1n), cborEncode(Math.floor(value.getTime() / 1e3))]);
+  }
+  if (Array.isArray(value)) {
+    const parts = [cborEncodeHead(4, BigInt(value.length))];
+    for (const item of value) parts.push(cborEncode(item));
+    return concatBytes3(parts);
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value).map(
+      ([k, v]) => [cborEncode(k), cborEncode(v)]
+    );
+    entries.sort((a, b) => compareCanonicalKeys(a[0], b[0]));
+    const parts = [cborEncodeHead(5, BigInt(entries.length))];
+    for (const [k, v] of entries) {
+      parts.push(k);
+      parts.push(v);
+    }
+    return concatBytes3(parts);
+  }
+  throw new Error(`cborEncode: unsupported value type ${typeof value}`);
+}
+function encodeDeroBech32(hrp, pointBytes33, args) {
+  if (pointBytes33.length !== 33) {
+    throw new Error(`encodeDeroBech32: point must be 33 bytes, got ${pointBytes33.length}`);
+  }
+  try {
+    deroDecompress(pointBytes33);
+  } catch (cause) {
+    throw new Error("encodeDeroBech32: invalid DERO compressed public key", { cause });
+  }
+  const wantsArgs = hrp === "deroi" || hrp === "detoi" || hrp === "deroproof";
+  const argBytes = wantsArgs ? cborEncode(args ?? {}) : new Uint8Array(0);
+  const body = new Uint8Array(1 + 33 + argBytes.length);
+  body[0] = 1;
+  body.set(pointBytes33, 1);
+  body.set(argBytes, 34);
+  const data5 = convertBits(Array.from(body), 8, 5, true);
+  return bech32Encode(hrp, data5);
+}
+function encodeForgeProofString(blinderCompressed33, amountUint64, hrp = "deroproof") {
+  if (amountUint64 < 0n || amountUint64 >= 1n << 64n) {
+    throw new Error(`encodeForgeProofString: amount out of uint64 range ${amountUint64}`);
+  }
+  return encodeDeroBech32(hrp, blinderCompressed33, {
+    HH: new Uint8Array(32),
+    VU: amountUint64
+  });
 }
 
 // resources/mcp/dero-mcp-server/src/tx-parse.ts

@@ -4,6 +4,8 @@ import { resolve } from 'node:path';
 import { getDb, getSetting } from '../db/client';
 import { BUILTIN_TOOLS, builtinExecutors } from './builtin';
 import { McpManager } from '../mcp/manager';
+import { getXswdManager } from '../xswd/instance';
+import { reviewXswdTransfer, reviewXswdScInvoke, type XswdTransferParams, type XswdScInvokeParams } from '../xswd/safety';
 
 export interface ToolContext {
   cwd: string;
@@ -23,6 +25,9 @@ export interface PermissionRequest {
   toolName: string;
   args: Record<string, unknown>;
   description?: string;
+  /** Human-readable, decoded review lines for irreversible wallet writes (network, amount,
+   *  ring size, integrated-invoice fields). Populated for dero_wallet_* when connected. */
+  reviewLines?: string[];
   conversationId?: string;
   projectPath?: string;
 }
@@ -62,16 +67,33 @@ export class ToolRegistry extends EventEmitter {
     if (rule?.action === 'deny') {
       return { content: `Denied by permission rule: ${name}`, isError: true };
     }
+    // Irreversible wallet writes are an un-bypassable gate: they always prompt,
+    // even under an 'allow' rule or approvalMode 'never', and the decision is
+    // never remembered (explicitAsk grants are not added to scopedAllow).
+    const forcedApproval = WALLET_WRITE_TOOLS.has(name);
     // An explicit `ask` rule always prompts. With no rule, sensitive built-ins
     // prompt, and so does any tool from an MCP server the user has not trusted.
     const implicitRisk = !rule && (this.requiresApproval(name) || (mcp !== null && !mcp.trusted));
-    if (rule?.action === 'ask' || implicitRisk) {
+    if (forcedApproval || rule?.action === 'ask' || implicitRisk) {
+      let reviewLines: string[] | undefined;
+      if (forcedApproval) {
+        try {
+          reviewLines = buildWalletWriteReview(name, args);
+        } catch (err) {
+          // A wallet is connected and the params fail validation — reject before
+          // prompting so the user never approves a transaction that cannot succeed.
+          return { content: `Wallet write rejected: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+        }
+      }
       const allowed = await this.authorize({
         requestId: cryptoRandom(),
         toolName: name,
         args,
-        description: mcp?.serverName ? `MCP server: ${mcp.serverName}` : undefined
-      }, ctx, rule?.action === 'ask');
+        description: forcedApproval
+          ? 'Irreversible wallet write; Hive and the connected wallet must both approve.'
+          : mcp?.serverName ? `MCP server: ${mcp.serverName}` : undefined,
+        reviewLines
+      }, ctx, forcedApproval || rule?.action === 'ask');
       if (!allowed) return { content: `User denied: ${name}`, isError: true };
     }
 
@@ -186,6 +208,13 @@ export class ToolRegistry extends EventEmitter {
     if (!ctx) return false;
     const rule = this.matchRule(req.toolName, req.args, ctx);
     if (rule?.action === 'deny') return false;
+    // Wallet writes always prompt — an 'allow' rule cannot bypass the gate.
+    if (WALLET_WRITE_TOOLS.has(req.toolName)) {
+      return this.authorize({
+        ...req,
+        description: req.description || 'Irreversible wallet write; Hive and the connected wallet must both approve.'
+      }, ctx, true);
+    }
     if (rule?.action === 'allow') return true;
     return this.authorize(req, ctx, rule?.action === 'ask');
   }
@@ -225,6 +254,25 @@ export class ToolRegistry extends EventEmitter {
       }, 120_000);
     });
   }
+}
+
+const WALLET_WRITE_TOOLS = new Set(['dero_wallet_transfer', 'dero_wallet_scinvoke']);
+
+/** Decode a wallet-write's args into human-readable approval lines. Returns undefined when
+ *  no wallet is connected (the wallet's own dialog + the executor remain the gate); throws
+ *  the validation message when a connected wallet's params are invalid, so the caller can
+ *  reject before prompting. */
+function buildWalletWriteReview(name: string, args: Record<string, unknown>): string[] | undefined {
+  const mgr = getXswdManager();
+  const address = mgr?.getConnectedAddress();
+  if (!mgr || !address) return undefined;
+  if (name === 'dero_wallet_transfer') {
+    return reviewXswdTransfer(args as unknown as XswdTransferParams, address).lines;
+  }
+  if (name === 'dero_wallet_scinvoke') {
+    return reviewXswdScInvoke(args as unknown as XswdScInvokeParams).lines;
+  }
+  return undefined;
 }
 
 function normalizeProjectPath(path: string): string {

@@ -888,3 +888,19 @@ export interface MediaListResponse {
   providers: MediaProviderConfig[];
   presets: MediaProviderPreset[];
 }
+
+// XSWD wallet bridge (DERO wallets expose an XSWD WebSocket server; Hive is the client)
+export type XswdConnectionState =
+  | 'disconnected'
+  | 'connecting'
+  | 'awaiting-approval'
+  | 'connected'
+  | 'error';
+
+export interface XswdStatus {
+  state: XswdConnectionState;
+  url: string;
+  appName: string;
+  connectedAt: number | null;
+  error: string | null;
+}

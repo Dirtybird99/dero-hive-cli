@@ -28,6 +28,17 @@ export interface PermissionView {
   toolName: string;
   args: Record<string, unknown>;
   description?: string;
+  /** Decoded, human-readable review lines for irreversible wallet writes. */
+  reviewLines?: string[];
+}
+
+/** Alt+<letter> detection. Ink's meta flag is unreliable across terminals, so also
+ *  match the raw CSI-u escapes some emulators emit for Alt chords. */
+export function isAltKey(character: string, key: { meta?: boolean; ctrl?: boolean }, letter: string): boolean {
+  const code = letter.charCodeAt(0);
+  return (Boolean(key.meta) && !key.ctrl && character.toLowerCase() === letter)
+    || character === `[${code};3u`
+    || character === `[27;3;${code}~`;
 }
 
 function shorten(value: string, max = 80): string {
@@ -609,6 +620,9 @@ export function PermissionPrompt({ request, theme }: { request: PermissionView; 
     <Box flexDirection="column" borderStyle="round" borderColor={theme.palette.warning} paddingX={1}>
       <Text color={theme.palette.warning} bold>Permission required · {request.toolName}</Text>
       {request.description && <Text color={theme.palette.muted}>{request.description}</Text>}
+      {request.reviewLines?.map((line, i) => (
+        <Text key={i} color={theme.palette.warning}>{line}</Text>
+      ))}
       <MarkdownBlock text={args} theme={theme} maxLines={10} />
       <Text><Text color={theme.palette.success}>[a] allow once</Text>  <Text color={theme.palette.accent}>[p] allow for project</Text>  <Text color={theme.palette.warning}>[g] always allow</Text>  <Text color={theme.palette.danger}>[d] deny</Text></Text>
     </Box>
