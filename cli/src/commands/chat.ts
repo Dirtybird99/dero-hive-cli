@@ -13,7 +13,8 @@ import * as projectService from '../services/project.js';
 import { runChat } from '../services/chat.js';
 import { listProviders } from '../../../src/main/providers/registry.js';
 import { paths, getDefaultWorkspace } from '../../../src/main/utils/paths.js';
-import { getDb } from '../../../src/main/db/client.js';
+import { getDb, getSetting } from '../../../src/main/db/client.js';
+import type { HookDefinition } from '../../../src/main/hooks/types.js';
 import type { Message, TokenUsage } from '../../../src/shared/types.js';
 import { APP_VERSION } from '../../../src/shared/version.js';
 import { loadBundledSkills, loadUserSkills } from '../../../src/main/skills/loader.js';
@@ -50,7 +51,7 @@ const SLASH_COMMANDS: Record<string, string> = {
   'diff': 'Show git diff in project',
   'focus': 'Toggle focus mode',
   'goal': 'Set a session goal  /goal <condition|clear>',
-  'hooks': 'View tool hook configurations',
+  'hooks': 'View configured lifecycle hooks',
   'init': 'Initialize project with guide',
   'mcp': 'MCP server management  /mcp <connect|list|disconnect>',
   'memory': 'View or edit session memory',
@@ -106,6 +107,7 @@ export function startChatRepl(oneShotPrompt?: string, options?: {
   system?: string;
   conversation?: string;
   cwd?: string;
+  json?: boolean;
 }): Promise<void> {
   return runChatSession(oneShotPrompt || undefined, options || {});
 }
@@ -129,6 +131,7 @@ async function runChatSession(oneShotPrompt?: string, options: {
   system?: string;
   conversation?: string;
   cwd?: string;
+  json?: boolean;
 } = {}): Promise<void> {
   await initHive();
   try {
@@ -155,7 +158,15 @@ async function runChatSession(oneShotPrompt?: string, options: {
     if (!providerId || !modelId) {
       const providers = listProviders().filter((p) => p.enabled);
       if (providers.length === 0) {
-        format.printError('No providers configured. Run `hive provider add` first.');
+        const msg = 'No providers configured. Run `hive provider add` first.';
+        if (oneShotPrompt && options.json) {
+          console.log(JSON.stringify(buildJsonResult({
+            ok: false, conversationId: '', messageId: '', content: '', toolCalls: [],
+            usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, error: msg
+          })));
+        } else {
+          format.printError(msg);
+        }
         if (oneShotPrompt) process.exitCode = 1;
         return;
       }
@@ -199,10 +210,11 @@ async function runChatSession(oneShotPrompt?: string, options: {
     config.saveState(state);
 
     if (oneShotPrompt) {
-      const ok = await sendMessage(conversationId!, oneShotPrompt, providerId!, modelId!, currentProjectPath, classicSystemPrompt(state.systemPrompt));
+      const ok = await sendMessage(conversationId!, oneShotPrompt, providerId!, modelId!, currentProjectPath, classicSystemPrompt(state.systemPrompt), options.json);
       if (!ok) process.exitCode = 1;
       return;
     }
+    if (options.json) console.error('note: --json applies only to one-shot chat; ignoring in interactive mode.');
 
     const conv = conversationService.getConversation(conversationId);
     const convTitle = conv?.title || 'New chat';
@@ -386,9 +398,52 @@ export function chatCommand(): Command {
     .option('--system <prompt>', 'System prompt')
     .option('--conversation <id>', 'Resume a conversation')
     .option('-C, --cwd <path>', 'Workspace directory')
+    .option('--json', 'One-shot only: emit a single JSON result object instead of formatted text')
     .action(async (prompt: string | undefined, options, command: Command) => {
       await startChatRepl(prompt, { ...(command.parent?.opts() || {}), ...options });
     });
+}
+
+// ── Headless JSON result ──────────────────────────────────────────────
+export interface JsonToolCall {
+  name: string;
+  args: Record<string, unknown>;
+  result: string;
+  isError: boolean;
+  durationMs: number;
+}
+
+export interface JsonChatResult {
+  ok: boolean;
+  conversationId: string;
+  messageId: string;
+  content: string;
+  toolCalls: JsonToolCall[];
+  usage: TokenUsage;
+  error?: string;
+}
+
+/** Shape the accumulated one-shot result into the object emitted by `--json`.
+ *  `error` is present only when something failed, so success output stays clean. */
+export function buildJsonResult(input: {
+  ok: boolean;
+  conversationId: string;
+  messageId: string;
+  content: string;
+  toolCalls: JsonToolCall[];
+  usage: TokenUsage;
+  error?: string;
+}): JsonChatResult {
+  const result: JsonChatResult = {
+    ok: input.ok,
+    conversationId: input.conversationId,
+    messageId: input.messageId,
+    content: input.content,
+    toolCalls: input.toolCalls,
+    usage: input.usage
+  };
+  if (input.error) result.error = input.error;
+  return result;
 }
 
 // ── Core sendMessage ──────────────────────────────────────────────────
@@ -398,7 +453,8 @@ async function sendMessage(
   providerId: string,
   model: string,
   cwd: string,
-  systemPrompt?: string
+  systemPrompt?: string,
+  json = false
 ): Promise<boolean> {
   const { tools } = getContext();
   const messages = conversationService.getMessages(conversationId);
@@ -410,20 +466,23 @@ async function sendMessage(
   };
   messages.push(userMsg);
 
-  console.log(chalk.green('\n  You  ') + prompt);
+  if (!json) console.log(chalk.green('\n  You  ') + prompt);
 
   const abort = new AbortController();
   currentAbortController = abort;
-  printTooltip('thinking...');
+  if (!json) printTooltip('thinking...');
 
   let content = '';
   let firstDelta = true;
   let hadToolCalls = false;
   let turnUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   let failed = false;
+  let errorMessage: string | undefined;
+  let messageId = '';
+  const collectedToolCalls: JsonToolCall[] = [];
 
   try {
-    await runChat(
+    const chatResult = await runChat(
       {
         conversationId,
         providerId,
@@ -438,16 +497,18 @@ async function sendMessage(
         signal: abort.signal,
         onEvent: (event) => {
           if (event.type === 'delta' && event.content) {
-            if (firstDelta) {
-              clearTooltip();
-              firstDelta = false;
-              process.stdout.write(chalk.magenta('\n  Assistant'));
+            if (!json) {
+              if (firstDelta) {
+                clearTooltip();
+                firstDelta = false;
+                process.stdout.write(chalk.magenta('\n  Assistant'));
+              }
+              process.stdout.write(event.content);
             }
             content += event.content;
-            process.stdout.write(event.content);
           } else if (event.type === 'tool_calls') {
             if (!hadToolCalls) {
-              if (firstDelta) clearTooltip();
+              if (!json && firstDelta) clearTooltip();
               firstDelta = false;
               hadToolCalls = true;
             }
@@ -455,47 +516,75 @@ async function sendMessage(
             turnUsage = event.usage;
           } else if (event.type === 'error') {
             failed = true;
-            clearTooltip();
-            format.printError(event.error);
+            errorMessage = event.error;
+            if (!json) {
+              clearTooltip();
+              format.printError(event.error);
+            }
           }
         },
         onToolResult: (info) => {
-          const argsStr = JSON.stringify(info.args).slice(0, 100);
-          const resultSnippet = info.result.content.length > 200
-            ? info.result.content.slice(0, 200) + '...'
-            : info.result.content;
-          console.log(chalk.yellow(`  [tool] ${info.toolName}(${argsStr})`));
-          if (info.result.isError) {
-            console.log(chalk.red(`  [error] ${resultSnippet}`));
-          } else {
-            console.log(chalk.gray(`  [result] ${resultSnippet}`));
+          collectedToolCalls.push({
+            name: info.toolName,
+            args: info.args,
+            result: info.result.content,
+            isError: Boolean(info.result.isError),
+            durationMs: info.durationMs
+          });
+          if (!json) {
+            const argsStr = JSON.stringify(info.args).slice(0, 100);
+            const resultSnippet = info.result.content.length > 200
+              ? info.result.content.slice(0, 200) + '...'
+              : info.result.content;
+            console.log(chalk.yellow(`  [tool] ${info.toolName}(${argsStr})`));
+            if (info.result.isError) {
+              console.log(chalk.red(`  [error] ${resultSnippet}`));
+            } else {
+              console.log(chalk.gray(`  [result] ${resultSnippet}`));
+            }
           }
         }
       }
     );
+    messageId = chatResult.messageId;
     if (abort.signal.aborted) throw new DOMException('Request cancelled.', 'AbortError');
 
-    if (firstDelta) clearTooltip();
-    if (content) process.stdout.write('\n\n');
+    if (!json) {
+      if (firstDelta) clearTooltip();
+      if (content) process.stdout.write('\n\n');
+    }
 
     // Track cumulative usage
     if (turnUsage.totalTokens > 0) {
       sessionUsage.promptTokens += turnUsage.promptTokens;
       sessionUsage.completionTokens += turnUsage.completionTokens;
       sessionUsage.totalTokens += turnUsage.totalTokens;
-      console.log(chalk.gray(`  [tokens] ${turnUsage.totalTokens} (${turnUsage.promptTokens} in / ${turnUsage.completionTokens} out)`));
+      if (!json) console.log(chalk.gray(`  [tokens] ${turnUsage.totalTokens} (${turnUsage.promptTokens} in / ${turnUsage.completionTokens} out)`));
     }
     sessionLastContent = content;
   } catch (err) {
     failed = true;
-    clearTooltip();
     if ((err as Error)?.name === 'AbortError' || (err as { code?: string })?.code === 'ABORT_ERR') {
-      console.log(chalk.gray('\n  Cancelled.'));
+      errorMessage = errorMessage || 'Request cancelled.';
+      if (!json) { clearTooltip(); console.log(chalk.gray('\n  Cancelled.')); }
     } else {
-      format.printError(`Chat failed: ${err instanceof Error ? err.message : String(err)}`);
+      errorMessage = err instanceof Error ? err.message : String(err);
+      if (!json) { clearTooltip(); format.printError(`Chat failed: ${errorMessage}`); }
     }
   } finally {
     currentAbortController = null;
+  }
+
+  if (json) {
+    console.log(JSON.stringify(buildJsonResult({
+      ok: !failed,
+      conversationId,
+      messageId,
+      content,
+      toolCalls: collectedToolCalls,
+      usage: turnUsage,
+      error: errorMessage
+    })));
   }
   return !failed;
 }
@@ -877,12 +966,15 @@ async function handleSlashCommand(
     }
 
     case 'hooks': {
-      const { tools } = getContext();
-      const rules = tools.listRules();
-      if (rules.length === 0) { format.printInfo('No hook configurations.'); break; }
-      console.log(chalk.bold('Permission rules:'));
-      for (const r of rules) {
-        console.log(`  ${chalk.cyan(r.toolName)} → ${r.action} ${r.scope ? `(scope: ${r.scope})` : ''}`);
+      const hooks = getSetting<HookDefinition[]>('hooks') || [];
+      if (hooks.length === 0) {
+        format.printInfo('No lifecycle hooks configured. Set the "hooks" setting to an array of { event: "preToolUse"|"postToolUse", command, toolPattern?, blocking? }.');
+        break;
+      }
+      console.log(chalk.bold('Lifecycle hooks:'));
+      for (const h of hooks) {
+        const scope = h.toolPattern ? ` [${h.toolPattern}]` : '';
+        console.log(`  ${chalk.cyan(h.event)}${scope} → ${h.command}${h.blocking ? chalk.yellow(' (blocking)') : ''}`);
       }
       break;
     }

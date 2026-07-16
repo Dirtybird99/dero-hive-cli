@@ -24,8 +24,9 @@ await build({
   },
   // Keep only native/runtime-provided modules external. Everything else is
   // bundled so the packaged desktop app does not need to preserve the CLI
-  // workspace's hoisted dependency layout.
-  external: ['better-sqlite3'],
+  // workspace's hoisted dependency layout. Native addons (.node) cannot be
+  // bundled — they must resolve from node_modules at runtime.
+  external: ['better-sqlite3', '@napi-rs/keyring'],
   plugins: [{
     name: 'optional-react-devtools',
     setup(buildApi) {

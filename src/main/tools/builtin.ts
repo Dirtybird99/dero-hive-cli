@@ -4,6 +4,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { lookup } from 'node:dns/promises';
+import ipaddr from 'ipaddr.js';
 import fg from 'fast-glob';
 import { resolveAndValidate } from '../utils/pathPolicy';
 import type { ToolExecutor, ToolContext, ToolResult } from './registry';
@@ -135,6 +137,34 @@ const SHELL_DEF: ToolDefinition = {
       timeout_ms: { type: 'integer', default: 30_000 }
     },
     required: ['command']
+  }
+};
+
+const WEB_FETCH_DEF: ToolDefinition = {
+  name: 'web_fetch',
+  description: 'Fetch a public web page or API over HTTP(S) and return its text. HTML is reduced to readable text. Blocks localhost and private/internal addresses.',
+  source: 'builtin',
+  parameters: {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: 'Absolute http(s) URL to fetch.' },
+      max_bytes: { type: 'integer', description: 'Maximum characters of body text to return (default 100000).' }
+    },
+    required: ['url']
+  }
+};
+
+const WEB_SEARCH_DEF: ToolDefinition = {
+  name: 'web_search',
+  description: 'Search the web and return ranked results (title, url, snippet). Uses a configured provider (HIVE_SEARCH_API_KEY) when set, otherwise a keyless fallback.',
+  source: 'builtin',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Search query.' },
+      count: { type: 'integer', description: 'Number of results to return (default 5, max 10).' }
+    },
+    required: ['query']
   }
 };
 
@@ -408,7 +438,7 @@ const WALLET_SCINVOKE_DEF: ToolDefinition = {
 export const BUILTIN_TOOLS: ToolDefinition[] = [
   READ_FILE_DEF, WRITE_FILE_DEF, EDIT_FILE_DEF,
   LIST_DIR_DEF, GLOB_DEF, GREP_DEF,
-  SHELL_DEF, TODO_DEF, DVM_LINT_DEF, SIMULATOR_INFO_DEF,
+  SHELL_DEF, WEB_FETCH_DEF, WEB_SEARCH_DEF, TODO_DEF, DVM_LINT_DEF, SIMULATOR_INFO_DEF,
   SIMULATOR_CREATE_WALLET_DEF, SIMULATOR_GET_BALANCE_DEF, SIMULATOR_GET_CONTRACT_STATE_DEF, SIMULATOR_GET_HEIGHT_DEF,
   GENERATE_IMAGE_DEF, GENERATE_AUDIO_DEF, GENERATE_VIDEO_DEF,
   GENERATE_DVM_CONTRACT_DEF,
@@ -711,18 +741,80 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
     const { command, cwd, timeout_ms } = args as { command: string; cwd?: string; timeout_ms?: number };
     const base = cwd ? safeResolve(cwd, ctx.cwd) : ctx.cwd;
     const timeout = timeout_ms || 30_000;
+    // An already-cancelled request never spawns a process at all.
+    if (ctx.signal?.aborted) {
+      return { content: '[cancelled] Command was cancelled before it started.', isError: true };
+    }
     try {
       const { stdout, stderr } = await execAsync(command, {
         cwd: base,
         timeout,
         maxBuffer: 10 * 1024 * 1024,
-        shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh'
+        shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh',
+        // exec kills the child itself when the signal aborts, so no manual
+        // abort listener is needed and nothing outlives the tool call.
+        signal: ctx.signal
       });
       const out = (stdout + (stderr ? `\n[stderr]\n${stderr}` : '')).trim();
       return { content: out.slice(0, 50_000) || '(no output)' };
     } catch (err) {
       const e = err as { stdout?: string; stderr?: string; message?: string };
+      // Abort mid-run: exec has already killed the child; surface a
+      // cancellation result (with any captured output) instead of an exit code.
+      if (ctx.signal?.aborted) {
+        return { content: `[cancelled]\n${e.stdout || ''}${e.stderr ? '\n[stderr]\n' + e.stderr : ''}`.trim(), isError: true };
+      }
       return { content: `[exit ${(err as { code?: number }).code ?? 'err'}]\n${e.stdout || ''}${e.stderr ? '\n[stderr]\n' + e.stderr : ''}\n${e.message || ''}`, isError: true };
+    }
+  },
+
+  async web_fetch(args, ctx) {
+    const url = typeof (args as { url?: unknown }).url === 'string' ? (args as { url: string }).url.trim() : '';
+    if (!url) return { content: 'url is required.', isError: true };
+    const maxBytes = typeof args.max_bytes === 'number' && args.max_bytes > 0
+      ? Math.min(1_000_000, Math.floor(args.max_bytes))
+      : 100_000;
+    const blocked = isBlockedUrl(url);
+    if (blocked.blocked) return { content: `Refusing to fetch ${url}: ${blocked.reason}`, isError: true };
+    try {
+      const res = await fetchWithRedirectGuard(url, ctx.signal, WEB_FETCH_TIMEOUT_MS);
+      const contentType = res.headers.get('content-type') || '';
+      const isText = /^(text\/|application\/(json|xml|xhtml|javascript|ld\+json)|application\/[^;]*\+(json|xml))/i.test(contentType);
+      if (!isText) {
+        const len = res.headers.get('content-length');
+        return {
+          content: `[${res.status}] ${res.url}\nNon-text content (${contentType || 'unknown type'}${len ? `, ${len} bytes` : ''}); body omitted.`,
+          meta: { url: res.url, status: res.status, contentType }
+        };
+      }
+      const raw = await res.text();
+      const body = /html/i.test(contentType) ? htmlToText(raw) : raw;
+      const truncated = body.length > maxBytes;
+      const out = truncated ? body.slice(0, maxBytes) + `\n\n... [truncated at ${maxBytes} chars]` : body;
+      return {
+        content: `[${res.status}] ${res.url}\n\n${out}`.trim(),
+        meta: { url: res.url, status: res.status, contentType, bytes: raw.length, truncated }
+      };
+    } catch (err) {
+      if (ctx.signal?.aborted) return { content: '[cancelled] Fetch was cancelled.', isError: true };
+      return { content: `Fetch failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+    }
+  },
+
+  async web_search(args, ctx) {
+    const query = typeof (args as { query?: unknown }).query === 'string' ? (args as { query: string }).query.trim() : '';
+    if (!query) return { content: 'query is required.', isError: true };
+    const count = typeof args.count === 'number' && args.count > 0 ? Math.min(10, Math.floor(args.count)) : 5;
+    try {
+      const results = await runWebSearch(query, count, ctx.signal);
+      if (results.length === 0) return { content: `No results for: ${query}`, meta: { query, results: [] } };
+      const text = results
+        .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ''}`)
+        .join('\n\n');
+      return { content: text, meta: { query, results } };
+    } catch (err) {
+      if (ctx.signal?.aborted) return { content: '[cancelled] Search was cancelled.', isError: true };
+      return { content: `Search failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
     }
   },
 
@@ -1081,5 +1173,261 @@ async function runMediaGeneration(
     };
   } catch (err) {
     return { content: `Media generation failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+  }
+}
+
+// ── Web tools (web_fetch / web_search) ────────────────────────────────
+const WEB_FETCH_TIMEOUT_MS = 15_000;
+const WEB_USER_AGENT = 'Mozilla/5.0 (compatible; DeroHive/1.0; +https://dero.io)';
+const MAX_REDIRECTS = 5;
+
+export interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+/**
+ * Reject URLs an agent should never be able to reach through web_fetch:
+ * non-http(s) schemes, localhost, and any IP literal that is not ordinary public
+ * unicast — loopback, private, link-local (incl. cloud metadata), CGNAT,
+ * multicast, reserved, broadcast, unspecified, and the IPv4-mapped IPv6 forms of
+ * all of those. IP classification is delegated to ipaddr.js so alternate textual
+ * forms (e.g. the hex ::ffff:7f00:1 that Node emits for ::ffff:127.0.0.1) can't
+ * slip through. DNS names pass this string guard and are resolved + re-checked at
+ * fetch time (fetchWithRedirectGuard) — the string guard alone is not
+ * DNS-rebinding proof. Each redirect hop is re-validated.
+ */
+export function isBlockedUrl(input: string): { blocked: boolean; reason?: string } {
+  let u: URL;
+  try {
+    u = new URL(input);
+  } catch {
+    return { blocked: true, reason: 'not a valid absolute URL' };
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return { blocked: true, reason: `unsupported scheme "${u.protocol}"` };
+  }
+  // Strip IPv6 brackets and any trailing dot(s): "localhost." / "127.0.0.1." are
+  // the same host as without the dot and must not slip past the checks.
+  const host = u.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
+  if (!host) return { blocked: true, reason: 'empty host' };
+  if (host === 'localhost' || host.endsWith('.localhost')) {
+    return { blocked: true, reason: 'localhost is not allowed' };
+  }
+  if (ipaddr.isValid(host)) {
+    return isBlockedAddress(host)
+      ? { blocked: true, reason: `non-public address (${host}) is not allowed` }
+      : { blocked: false };
+  }
+  // An IP-shaped host that does not parse is a malformed literal — fail safe.
+  if (/^[0-9.]+$/.test(host) || host.includes(':')) {
+    return { blocked: true, reason: `malformed IP literal (${host})` };
+  }
+  return { blocked: false }; // hostname — resolved and re-checked at fetch time
+}
+
+/**
+ * True if an IP-literal string is anything other than ordinary public unicast.
+ * IPv4-mapped IPv6 is decoded to its IPv4 form first, so ::ffff:127.0.0.1 (in any
+ * textual form) classifies as loopback. Shared by isBlockedUrl and the fetch-time
+ * DNS re-check so both call sites and their tests hang off one function.
+ */
+export function isBlockedAddress(ip: string): boolean {
+  let addr: ReturnType<typeof ipaddr.parse>;
+  try {
+    addr = ipaddr.parse(ip);
+  } catch {
+    return true; // unparseable but reached as an IP candidate → fail safe
+  }
+  if (addr.kind() === 'ipv6') {
+    const v6 = addr as ipaddr.IPv6;
+    if (v6.isIPv4MappedAddress()) return v6.toIPv4Address().range() !== 'unicast';
+    return v6.range() !== 'unicast';
+  }
+  return (addr as ipaddr.IPv4).range() !== 'unicast';
+}
+
+/** Resolve a hostname to its IP addresses. Injectable so tests never hit the network. */
+export type HostResolver = (host: string) => Promise<string[]>;
+const realHostResolver: HostResolver = async (host) => (await lookup(host, { all: true })).map((r) => r.address);
+let resolveHostAddresses: HostResolver = realHostResolver;
+
+/** Test seam: override DNS resolution (pass null to restore the real resolver). */
+export function __setHostResolverForTest(fn: HostResolver | null): void {
+  resolveHostAddresses = fn ?? realHostResolver;
+}
+
+/** For a DNS hostname, resolve it and reject if any resolved address is non-public.
+ *  Closes the DNS-rebinding gap the string guard cannot (e.g. lvh.me → 127.0.0.1).
+ *  Unresolvable hosts are left for fetch to fail on naturally. */
+async function assertHostResolvesPublic(host: string): Promise<void> {
+  let addrs: string[];
+  try {
+    addrs = await resolveHostAddresses(host);
+  } catch {
+    return;
+  }
+  for (const a of addrs) {
+    if (isBlockedAddress(a)) {
+      throw new Error(`host ${host} resolves to a non-public address (${a})`);
+    }
+  }
+}
+
+/** Fetch following redirects manually so each hop is re-validated against isBlockedUrl,
+ *  and DNS-name hosts are resolved and re-checked before each connection. */
+async function fetchWithRedirectGuard(startUrl: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const onAbort = (): void => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    let url = startUrl;
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      const blocked = isBlockedUrl(url);
+      if (blocked.blocked) throw new Error(`redirect blocked: ${blocked.reason}`);
+      // DNS names pass the string guard; resolve and re-check to defeat rebinding.
+      const host = new URL(url).hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
+      if (host && !ipaddr.isValid(host)) await assertHostResolvesPublic(host);
+      const res = await fetch(url, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: { 'user-agent': WEB_USER_AGENT, accept: 'text/html,application/json;q=0.9,*/*;q=0.8' }
+      });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get('location');
+        if (!loc) return res;
+        url = new URL(loc, url).toString();
+        continue;
+      }
+      return res;
+    }
+    throw new Error(`too many redirects (>${MAX_REDIRECTS})`);
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
+}
+
+/** Reduce an HTML document to readable text: drop script/style/comments, turn block
+ *  boundaries into newlines, strip tags, decode common entities, collapse whitespace. */
+export function htmlToText(html: string): string {
+  let s = html;
+  s = s.replace(/<!--[\s\S]*?-->/g, ' ');
+  s = s.replace(/<(script|style|noscript|template|svg)[\s\S]*?<\/\1>/gi, ' ');
+  s = s.replace(/<\/(p|div|section|article|header|footer|li|tr|h[1-6]|ul|ol|table|blockquote)>/gi, '\n');
+  s = s.replace(/<br\s*\/?>/gi, '\n');
+  s = s.replace(/<[^>]+>/g, ' ');
+  s = decodeEntities(s);
+  s = s.replace(/[ \t\f\v]+/g, ' ');
+  s = s.replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n');
+  return s.trim();
+}
+
+function decodeEntities(s: string): string {
+  const named: Record<string, string> = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', '#39': "'", mdash: '—', ndash: '–', hellip: '…'
+  };
+  return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (m, code: string) => {
+    if (code[0] === '#') {
+      const cp = code[1] === 'x' || code[1] === 'X' ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
+      return Number.isFinite(cp) ? String.fromCodePoint(cp) : m;
+    }
+    return named[code] ?? m;
+  });
+}
+
+async function runWebSearch(query: string, count: number, signal: AbortSignal | undefined): Promise<WebSearchResult[]> {
+  const apiKey = process.env.HIVE_SEARCH_API_KEY;
+  const provider = (process.env.HIVE_SEARCH_PROVIDER || 'brave').toLowerCase();
+  if (apiKey && provider === 'brave') return braveSearch(query, count, apiKey, signal);
+  if (apiKey && provider === 'tavily') return tavilySearch(query, count, apiKey, signal);
+  return duckDuckGoSearch(query, count, signal);
+}
+
+async function braveSearch(query: string, count: number, apiKey: string, signal: AbortSignal | undefined): Promise<WebSearchResult[]> {
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`;
+  const res = await timedFetch(url, { headers: { accept: 'application/json', 'x-subscription-token': apiKey } }, signal);
+  if (!res.ok) throw new Error(`Brave search HTTP ${res.status}`);
+  const body = await res.json() as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
+  return (body.web?.results || []).slice(0, count).map((r) => ({
+    title: r.title || r.url || '(untitled)',
+    url: r.url || '',
+    snippet: stripTags(r.description || '')
+  }));
+}
+
+async function tavilySearch(query: string, count: number, apiKey: string, signal: AbortSignal | undefined): Promise<WebSearchResult[]> {
+  const res = await timedFetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ api_key: apiKey, query, max_results: count })
+  }, signal);
+  if (!res.ok) throw new Error(`Tavily search HTTP ${res.status}`);
+  const body = await res.json() as { results?: Array<{ title?: string; url?: string; content?: string }> };
+  return (body.results || []).slice(0, count).map((r) => ({
+    title: r.title || r.url || '(untitled)',
+    url: r.url || '',
+    snippet: (r.content || '').slice(0, 300)
+  }));
+}
+
+async function duckDuckGoSearch(query: string, count: number, signal: AbortSignal | undefined): Promise<WebSearchResult[]> {
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  const res = await timedFetch(url, { headers: { 'user-agent': WEB_USER_AGENT, accept: 'text/html' } }, signal);
+  if (!res.ok) throw new Error(`DuckDuckGo HTTP ${res.status}`);
+  return parseDuckDuckGoHtml(await res.text()).slice(0, count);
+}
+
+/** Parse DuckDuckGo's HTML results page into structured results. Exported for tests. */
+export function parseDuckDuckGoHtml(html: string): WebSearchResult[] {
+  const out: WebSearchResult[] = [];
+  const linkRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippetRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippets: string[] = [];
+  let sm: RegExpExecArray | null;
+  while ((sm = snippetRe.exec(html))) snippets.push(stripTags(sm[1]));
+  let lm: RegExpExecArray | null;
+  let i = 0;
+  while ((lm = linkRe.exec(html))) {
+    out.push({ title: stripTags(lm[2]).trim(), url: decodeDuckDuckGoHref(lm[1]), snippet: (snippets[i] || '').trim() });
+    i++;
+  }
+  return out;
+}
+
+function decodeDuckDuckGoHref(href: string): string {
+  // DDG wraps result links as //duckduckgo.com/l/?uddg=<encoded>&...
+  try {
+    const u = new URL(href, 'https://duckduckgo.com');
+    const target = u.searchParams.get('uddg');
+    return target ? decodeURIComponent(target) : href;
+  } catch {
+    return href;
+  }
+}
+
+function stripTags(s: string): string {
+  return decodeEntities(s.replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+}
+
+async function timedFetch(url: string, init: RequestInit, signal: AbortSignal | undefined): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
+  const onAbort = (): void => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
