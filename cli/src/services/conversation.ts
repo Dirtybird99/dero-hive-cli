@@ -1,6 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import { getDb } from '../../../src/main/db/client.js';
 import type { Conversation, Message, SearchResult } from '../../../src/shared/types.js';
+import { canonicalWorkspacePath } from '../../../src/shared/workspace.js';
+import { deleteStoredAttachments, serializedAttachmentIds } from '../../../src/main/utils/attachments.js';
+
+function attachmentIdsFromRows(rows: Array<{ content: string }>): string[] {
+  return rows.flatMap((row) => serializedAttachmentIds(row.content));
+}
+
+export async function deleteUnreferencedAttachments(candidates: Iterable<string>): Promise<void> {
+  const ids = new Set(candidates);
+  if (!ids.size) return;
+  const referenced = new Set(attachmentIdsFromRows(
+    getDb().prepare("SELECT content FROM messages WHERE content LIKE '%attachment_ref%'").all() as Array<{ content: string }>
+  ));
+  await deleteStoredAttachments([...ids].filter((id) => !referenced.has(id)));
+}
 
 export function createConversation(options: {
   title?: string;
@@ -8,6 +23,7 @@ export function createConversation(options: {
   model?: string;
   systemPrompt?: string;
   projectId?: string;
+  workspacePath: string;
   parentId?: string;
 }): Conversation {
   const now = Date.now();
@@ -15,10 +31,11 @@ export function createConversation(options: {
   const title = options.title?.trim() || 'New chat';
   const providerId = options.providerId || '';
   const model = options.model || '';
+  const workspacePath = canonicalWorkspacePath(options.workspacePath);
   getDb()
     .prepare(
-      `INSERT INTO conversations (id, title, created_at, updated_at, provider_id, model, system_prompt, project_id, parent_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO conversations (id, title, created_at, updated_at, provider_id, model, system_prompt, project_id, workspace_path, parent_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
@@ -29,6 +46,7 @@ export function createConversation(options: {
       model,
       options.systemPrompt || null,
       options.projectId || null,
+      workspacePath,
       options.parentId || null
     );
   return {
@@ -40,6 +58,7 @@ export function createConversation(options: {
     model,
     systemPrompt: options.systemPrompt,
     projectId: options.projectId,
+    workspacePath,
     parentId: options.parentId,
     messageCount: 0
   };
@@ -60,13 +79,24 @@ export function listConversations(projectId?: string): Conversation[] {
   return rows.map(rowToConversation);
 }
 
-export function deleteConversation(id: string): void {
+export function listConversationsForWorkspace(workspacePath: string): Conversation[] {
+  const canonical = canonicalWorkspacePath(workspacePath);
+  const rows = getDb().prepare(
+    'SELECT * FROM conversations WHERE workspace_path = ? ORDER BY updated_at DESC'
+  ).all(canonical) as Array<Record<string, unknown>>;
+  return rows.map(rowToConversation);
+}
+
+export async function deleteConversation(id: string): Promise<void> {
   const db = getDb();
-  db.transaction(() => {
+  const candidates = db.transaction(() => {
+    const rows = db.prepare('SELECT content FROM messages WHERE conversation_id = ?').all(id) as Array<{ content: string }>;
     db.prepare('DELETE FROM messages_fts WHERE conversation_id = ?').run(id);
     db.prepare('DELETE FROM messages WHERE conversation_id = ?').run(id);
     db.prepare('DELETE FROM conversations WHERE id = ?').run(id);
-  })();
+    return attachmentIdsFromRows(rows);
+  }).immediate();
+  await deleteUnreferencedAttachments(candidates);
 }
 
 export function updateConversationTitle(id: string, title: string): void {
@@ -96,70 +126,78 @@ export function updateConversation(
 }
 
 export function forkConversation(id: string): Conversation | null {
-  const conv = getConversation(id);
-  if (!conv) return null;
-  const newConv = createConversation({
-    title: `${conv.title} (fork)`,
-    providerId: conv.providerId,
-    model: conv.model,
-    systemPrompt: conv.systemPrompt,
-    projectId: conv.projectId,
-    parentId: conv.id
-  });
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM conversations WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    const conv = rowToConversation(row);
+    if (!conv.workspacePath) throw new Error('Cannot fork a conversation without a workspace scope.');
+    const newConv = createConversation({
+      title: `${conv.title} (fork)`,
+      providerId: conv.providerId,
+      model: conv.model,
+      systemPrompt: conv.systemPrompt,
+      projectId: conv.projectId,
+      workspacePath: conv.workspacePath,
+      parentId: conv.id
+    });
 
-  const rows = getDb()
-    .prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC')
-    .all(id) as Array<Record<string, unknown>>;
-  for (const row of rows) {
-    const msg = rowToMessage(row);
-    msg.id = randomUUID();
-    msg.createdAt = Date.now();
-    persistMessage(newConv.id, msg);
-  }
-  return newConv;
+    const rows = db
+      .prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC, rowid ASC')
+      .all(id) as Array<Record<string, unknown>>;
+    for (const messageRow of rows) {
+      const msg = rowToMessage(messageRow);
+      msg.id = randomUUID();
+      msg.createdAt = Date.now();
+      persistMessage(newConv.id, msg);
+    }
+    return newConv;
+  }).immediate();
 }
 
 export function getMessages(conversationId: string): Message[] {
   const rows = getDb()
-    .prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC')
+    .prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC, rowid ASC')
     .all(conversationId) as Array<Record<string, unknown>>;
   return rows.map(rowToMessage);
 }
 
 export function persistMessage(conversationId: string, msg: Message): void {
-  const maxOrder = (
-    getDb()
-      .prepare('SELECT COALESCE(MAX(sort_order), 0) AS m FROM messages WHERE conversation_id = ?')
-      .get(conversationId) as { m: number }
-  ).m;
-  getDb()
-    .prepare(
+  const db = getDb();
+  // IMMEDIATE takes the writer slot before MAX is read, so another CLI process
+  // cannot allocate the same per-conversation sort order.
+  db.transaction(() => {
+    const maxOrder = (
+      db
+        .prepare('SELECT COALESCE(MAX(sort_order), 0) AS m FROM messages WHERE conversation_id = ?')
+        .get(conversationId) as { m: number }
+    ).m;
+    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    db.prepare(
       `INSERT INTO messages (id, conversation_id, role, content, reasoning, tool_calls, tool_call_id, name, model, provider, usage, error, created_at, sort_order)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(
-      msg.id,
-      conversationId,
-      msg.role,
-      typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
-      msg.reasoning || null,
-      msg.toolCalls ? JSON.stringify(msg.toolCalls) : null,
-      msg.toolCallId || null,
-      msg.name || null,
-      msg.model || null,
-      msg.provider || null,
-      msg.usage ? JSON.stringify(msg.usage) : null,
-      msg.error || null,
-      msg.createdAt,
-      maxOrder + 1
-    );
-  const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-  getDb()
-    .prepare('INSERT INTO messages_fts (rowid, content, conversation_id, message_id) VALUES ((SELECT rowid FROM messages WHERE id = ?), ?, ?, ?)')
-    .run(msg.id, content, conversationId, msg.id);
-  getDb()
-    .prepare('UPDATE conversations SET message_count = message_count + 1, updated_at = ? WHERE id = ?')
-    .run(Date.now(), conversationId);
+      .run(
+        msg.id,
+        conversationId,
+        msg.role,
+        content,
+        msg.reasoning || null,
+        msg.toolCalls ? JSON.stringify(msg.toolCalls) : null,
+        msg.toolCallId || null,
+        msg.name || null,
+        msg.model || null,
+        msg.provider || null,
+        msg.usage ? JSON.stringify(msg.usage) : null,
+        msg.error || null,
+        msg.createdAt,
+        maxOrder + 1
+      );
+    db.prepare('INSERT INTO messages_fts (rowid, content, conversation_id, message_id) VALUES ((SELECT rowid FROM messages WHERE id = ?), ?, ?, ?)')
+      .run(msg.id, content, conversationId, msg.id);
+    db.prepare('UPDATE conversations SET message_count = message_count + 1, updated_at = ? WHERE id = ?')
+      .run(Date.now(), conversationId);
+  }).immediate();
 }
 
 export function updateConversationPreview(conversationId: string, content: string): void {
@@ -196,27 +234,29 @@ export function searchConversations(query: string): SearchResult[] {
   }));
 }
 
-export function removeLastExchange(conversationId: string): number {
+export async function removeLastExchange(conversationId: string): Promise<number> {
   const db = getDb();
-  const rows = db.prepare(
-    'SELECT id, role, sort_order FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC'
-  ).all(conversationId) as Array<{ id: string; role: string; sort_order: number }>;
-  let start = -1;
-  for (let index = rows.length - 1; index >= 0; index--) {
-    if (rows[index].role === 'user') { start = index; break; }
-  }
-  if (start < 0) return 0;
-  const removed = rows.slice(start);
-  const ids = removed.map((row) => row.id);
-  const placeholders = ids.map(() => '?').join(',');
-  db.transaction(() => {
+  const mutation = db.transaction(() => {
+    const rows = db.prepare(
+      'SELECT id, role, sort_order, content FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC, rowid ASC'
+    ).all(conversationId) as Array<{ id: string; role: string; sort_order: number; content: string }>;
+    let start = -1;
+    for (let index = rows.length - 1; index >= 0; index--) {
+      if (rows[index].role === 'user') { start = index; break; }
+    }
+    if (start < 0) return { removedCount: 0, candidates: [] as string[] };
+    const removed = rows.slice(start);
+    const ids = removed.map((row) => row.id);
+    const placeholders = ids.map(() => '?').join(',');
     db.prepare(`DELETE FROM messages_fts WHERE message_id IN (${placeholders})`).run(...ids);
     db.prepare(`DELETE FROM messages WHERE id IN (${placeholders})`).run(...ids);
     db.prepare(`UPDATE conversations SET message_count = (
       SELECT COUNT(*) FROM messages WHERE conversation_id = ?
     ), updated_at = ? WHERE id = ?`).run(conversationId, Date.now(), conversationId);
-  })();
-  return removed.length;
+    return { removedCount: removed.length, candidates: attachmentIdsFromRows(removed) };
+  }).immediate();
+  await deleteUnreferencedAttachments(mutation.candidates);
+  return mutation.removedCount;
 }
 
 export interface ContextEstimate {
@@ -240,10 +280,26 @@ export interface CompactResult {
   tokensSaved: number;
 }
 
-export function compactConversation(conversationId: string, keepRecentMessages = 8, instructions?: string): CompactResult {
+export async function compactConversation(conversationId: string, keepRecentMessages = 8, instructions?: string): Promise<CompactResult> {
   const db = getDb();
+  const mutation = db.transaction(() => ({
+    candidates: attachmentIdsFromRows(db.prepare(
+      "SELECT content FROM messages WHERE conversation_id = ? AND content LIKE '%attachment_ref%'"
+    ).all(conversationId) as Array<{ content: string }>),
+    result: compactConversationLocked(db, conversationId, keepRecentMessages, instructions)
+  })).immediate();
+  if (mutation.result.removedCount) await deleteUnreferencedAttachments(mutation.candidates);
+  return mutation.result;
+}
+
+function compactConversationLocked(
+  db: ReturnType<typeof getDb>,
+  conversationId: string,
+  keepRecentMessages: number,
+  instructions?: string
+): CompactResult {
   const rows = db.prepare(
-    'SELECT * FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC'
+    'SELECT * FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC, rowid ASC'
   ).all(conversationId) as Array<Record<string, unknown>>;
   const systemRows = rows.filter((row) => row.role === 'system' && row.name !== 'context_compaction');
   const normalRows = rows.filter((row) => row.role !== 'system' || row.name === 'context_compaction');
@@ -339,6 +395,7 @@ function rowToConversation(row: Record<string, unknown>): Conversation {
     pinned: !!row.pinned,
     archived: !!row.archived,
     projectId: (row.project_id as string | null) || undefined,
+    workspacePath: (row.workspace_path as string | null) || undefined,
     parentId: (row.parent_id as string | null) || undefined,
     totalTokens: (row.total_tokens as number) || undefined,
     messageCount: (row.message_count as number) || 0,

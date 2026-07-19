@@ -54,9 +54,11 @@ try {
     })
     // ponytail: conformance 0.1.16 can trip a libuv shutdown assertion on
     // Windows after printing a successful result; remove when upstream fixes it.
+    const summary = /^Passed:\s+(\d+)\/(\d+),\s+0 failed,\s+0 warnings\s*$/mu.exec(result.output)
     const successfulWindowsShutdownCrash = process.platform === 'win32'
       && result.code === 3221226505
-      && result.output.includes('0 failed')
+      && Number(summary?.[1]) > 0
+      && summary?.[1] === summary?.[2]
     if (result.code !== 0 && !successfulWindowsShutdownCrash) {
       throw new Error(`MCP conformance scenario ${scenario} failed (${result.signal || result.code})`)
     }

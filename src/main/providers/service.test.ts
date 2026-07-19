@@ -3,12 +3,14 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { MAX_PROVIDER_JSON_BYTES } from './http.js';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'dero-hive-providers-'));
 process.env.HIVE_DATA_DIR = dataDir;
 
 const requests: Array<{ url: string; authorization?: string }> = [];
 const slowResponses: ServerResponse[] = [];
+const heldResponses: ServerResponse[] = [];
 const server = createServer((req, res) => {
   requests.push({ url: req.url || '', authorization: req.headers.authorization });
   res.setHeader('content-type', 'application/json');
@@ -23,6 +25,12 @@ const server = createServer((req, res) => {
   }
   if (req.url === '/slow/models') {
     slowResponses.push(res); // held open until the test releases it
+    return;
+  }
+  if (req.url === '/oversized/models') {
+    res.setHeader('content-length', String(MAX_PROVIDER_JSON_BYTES + 1));
+    res.flushHeaders();
+    heldResponses.push(res); // declared oversized and intentionally never completed
     return;
   }
   res.end(JSON.stringify({
@@ -190,6 +198,13 @@ try {
       'failed discovery must keep the seeded fallback models');
     assert.ok(!emptyList.provider.modelsFetchedAt, 'failed discovery must not stamp a fetch timestamp');
 
+    const oversizedList = await saveProvider({
+      id: 'oversized', presetId: 'openai', name: 'Oversized list', baseUrl: `${baseUrl}/oversized`, defaultModel: 'seed-model'
+    });
+    assert.equal(oversizedList.discovery.ok, false, 'oversized model discovery must fail without buffering the body');
+    assert.deepEqual(oversizedList.provider.models.map((model) => model.id), ['seed-model']);
+    assert.equal(setProviderEnabled('oversized', false).ok, true);
+
     // -----------------------------------------------------------------------
     // Malformed provider rows degrade to safe defaults instead of throwing.
     // -----------------------------------------------------------------------
@@ -320,6 +335,7 @@ try {
 
     assert.equal(removeProvider('no-url').ok, true);
     assert.equal(removeProvider('empty').ok, true);
+    assert.equal(removeProvider('oversized').ok, true);
     assert.equal(removeProvider('slow').ok, true);
 
     assert.equal(removeProvider('local').ok, true);
@@ -332,6 +348,7 @@ try {
   console.log('provider service tests passed');
 } finally {
   for (const res of slowResponses) res.destroy();
+  for (const res of heldResponses) res.destroy();
   server.close();
   rmSync(dataDir, { recursive: true, force: true });
 }

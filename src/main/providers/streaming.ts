@@ -1,5 +1,6 @@
 import { createParser, type EventSourceMessage, ParseError } from 'eventsource-parser';
 import { logger } from '../utils/logger';
+import { MAX_PROVIDER_SSE_EVENT_BYTES, MAX_PROVIDER_STREAM_BYTES } from './http';
 
 export interface SseEvent {
   event?: string;
@@ -15,24 +16,25 @@ export async function* parseSSE(
 ): AsyncGenerator<SseEvent> {
   if (!response.body) throw new Error('No response body');
 
-  const queue: SseEvent[] = [];
-  let resolver: (() => void) | null = null;
-  let error: Error | null = null;
-  let done = false;
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isSafeInteger(declared) && declared > MAX_PROVIDER_STREAM_BYTES) {
+    void response.body.cancel().catch(() => undefined);
+    throw new Error(`Provider stream exceeds ${MAX_PROVIDER_STREAM_BYTES} byte limit`);
+  }
 
-  const wake = (): void => {
-    if (resolver) { const r = resolver; resolver = null; r(); }
-  };
+  const queue: SseEvent[] = [];
 
   const parser = createParser({
     onEvent: (msg: EventSourceMessage) => {
       const raw = msg.data;
+      if (Buffer.byteLength(raw, 'utf8') > MAX_PROVIDER_SSE_EVENT_BYTES) {
+        throw new Error(`Provider SSE event exceeds ${MAX_PROVIDER_SSE_EVENT_BYTES} byte limit`);
+      }
       let data: unknown = raw;
       if (raw && raw !== '[DONE]') {
         try { data = JSON.parse(raw); } catch { /* keep as string */ }
       }
       queue.push({ event: msg.event || undefined, data, raw });
-      wake();
     },
     onError: (err: ParseError) => {
       logger.debug('sse', `parser error: ${err.type}`);
@@ -41,56 +43,98 @@ export async function* parseSSE(
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
-
-  const abortHandler = (): void => {
-    error = new Error('Aborted');
-    done = true;
-    // Fire-and-forget: cancel() rejects when the fetch layer has already
-    // errored the stream, so swallow the rejection to keep it from escaping
-    // as an unhandled rejection.
-    try { reader.cancel().catch(() => { /* ignore */ }); } catch { /* ignore */ }
-    wake();
-  };
+  let frame = Buffer.allocUnsafe(Math.min(4096, MAX_PROVIDER_SSE_EVENT_BYTES));
+  let frameLength = 0;
+  let lineBytes = 0;
+  let pendingCr = false;
+  let totalBytes = 0;
+  let rejectAbort!: (error: unknown) => void;
+  const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+  const abortHandler = (): void => rejectAbort(signal?.reason || new DOMException('Aborted', 'AbortError'));
   if (signal) {
     if (signal.aborted) abortHandler();
-    else signal.addEventListener('abort', abortHandler);
+    else signal.addEventListener('abort', abortHandler, { once: true });
   }
 
-  (async () => {
-    try {
-      while (!done) {
-        const { value, done: streamDone } = await reader.read();
-        if (streamDone) {
-          done = true;
-          wake();
-          break;
-        }
-        buffer += decoder.decode(value, { stream: true });
-        parser.feed(buffer);
-        buffer = '';
-      }
-    } catch (err) {
-      error = err as Error;
-      done = true;
-      wake();
+  const appendByte = (byte: number): void => {
+    if (frameLength >= MAX_PROVIDER_SSE_EVENT_BYTES) {
+      throw new Error(`Provider SSE event exceeds ${MAX_PROVIDER_SSE_EVENT_BYTES} byte limit`);
     }
-  })();
+    if (frameLength === frame.length) {
+      const expanded = Buffer.allocUnsafe(Math.min(MAX_PROVIDER_SSE_EVENT_BYTES, Math.max(1, frame.length) * 2));
+      frame.copy(expanded, 0, 0, frameLength);
+      frame = expanded;
+    }
+    frame[frameLength] = byte;
+    frameLength += 1;
+  };
+
+  const feedFrame = (): void => {
+    parser.feed(decoder.decode(frame.subarray(0, frameLength)));
+    frameLength = 0;
+  };
 
   try {
-    while (true) {
-      if (queue.length === 0) {
-        if (error) throw error;
-        if (done) return;
-        await new Promise<void>((r) => { resolver = r; });
-        continue;
+    for (;;) {
+      const read = reader.read();
+      const { value, done } = signal ? await Promise.race([read, aborted]) : await read;
+      if (done) break;
+      if (!value?.byteLength) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_PROVIDER_STREAM_BYTES) {
+        throw new Error(`Provider stream exceeds ${MAX_PROVIDER_STREAM_BYTES} byte limit`);
       }
-      yield queue.shift()!;
-      if (done && queue.length === 0) return;
+      for (const byte of value) {
+        if (pendingCr) {
+          if (byte === 0x0a) {
+            appendByte(byte);
+            const boundary = lineBytes === 0;
+            pendingCr = false;
+            lineBytes = 0;
+            if (boundary) {
+              feedFrame();
+              while (queue.length) yield queue.shift()!;
+            }
+            continue;
+          }
+          const boundary = lineBytes === 0;
+          pendingCr = false;
+          lineBytes = 0;
+          if (boundary) {
+            feedFrame();
+            while (queue.length) yield queue.shift()!;
+          }
+        }
+
+        appendByte(byte);
+        if (byte === 0x0d) {
+          pendingCr = true;
+        } else if (byte === 0x0a) {
+          const boundary = lineBytes === 0;
+          lineBytes = 0;
+          if (boundary) {
+            feedFrame();
+            while (queue.length) yield queue.shift()!;
+          }
+        } else {
+          lineBytes += 1;
+        }
+      }
+    }
+    if (pendingCr && lineBytes === 0) {
+      feedFrame();
+      while (queue.length) yield queue.shift()!;
+      pendingCr = false;
+    }
+    if (frameLength) {
+      feedFrame();
+      while (queue.length) yield queue.shift()!;
     }
   } finally {
     if (signal) signal.removeEventListener('abort', abortHandler);
-    try { await reader.cancel(); } catch { /* ignore */ }
+    // A custom/hostile stream may never settle cancel(); cleanup cannot be
+    // allowed to outlive the request deadline. Keep any rejection handled.
+    try { void reader.cancel().catch(() => undefined); } catch { /* ignore */ }
   }
 }
 

@@ -3,6 +3,7 @@ import { Box, Text, useInput } from 'ink';
 import type { DOMElement } from 'ink';
 import type { Message, ThinkingEffort, TokenUsage } from '../../../src/shared/types.js';
 import { APP_VERSION } from '../../../src/shared/version.js';
+import { sanitizeTerminalText } from '../../../src/shared/terminal.js';
 import type { ResolvedTerminalTheme } from './themes.js';
 import { SgrMouseParser } from './mouse.js';
 
@@ -42,20 +43,20 @@ export function isAltKey(character: string, key: { meta?: boolean; ctrl?: boolea
 }
 
 function shorten(value: string, max = 80): string {
-  const singleLine = value.replace(/\s+/g, ' ').trim();
+  const singleLine = sanitizeTerminalText(value).replace(/\s+/g, ' ').trim();
   return singleLine.length <= max ? singleLine : `${singleLine.slice(0, Math.max(0, max - 1))}…`;
 }
 
 function contentText(message: Message): string {
-  if (typeof message.content === 'string') return message.content;
-  return message.content.map((part) => {
+  if (typeof message.content === 'string') return sanitizeTerminalText(message.content);
+  return sanitizeTerminalText(message.content.map((part) => {
     if (part.type === 'text') return part.text;
     if (part.type === 'attachment_ref') return `@${part.attachment.filename}`;
     if (part.type === 'file') return `@${part.file.filename}`;
     if (part.type === 'image_url') return '[image]';
     if (part.type === 'input_audio') return '[audio]';
     return '';
-  }).filter(Boolean).join('\n');
+  }).filter(Boolean).join('\n'));
 }
 
 export function ComposerInput({ value, onChange, onSubmit, placeholder = '', focus = true, multiline = false, inputKey = 'composer', masked = false }: {
@@ -320,7 +321,7 @@ export function MarkdownBlock({ text, theme, maxLines }: {
   theme: ResolvedTerminalTheme;
   maxLines?: number;
 }): JSX.Element {
-  const rawLines = text.replace(/\r\n/g, '\n').split('\n');
+  const rawLines = sanitizeTerminalText(text).split('\n');
   const lines = maxLines && rawLines.length > maxLines
     ? [...rawLines.slice(0, Math.max(1, maxLines - 1)), `… ${rawLines.length - maxLines + 1} more line(s)`]
     : rawLines;
@@ -416,7 +417,7 @@ export function ToolRow({ tool, theme, expanded }: {
     ? ` +${String(meta.linesAdded || 0)} -${String(meta.linesRemoved || 0)}` : '';
   return (
     <Box flexDirection="column" paddingLeft={1}>
-      <Text color={color}>└─ {icon} <Text bold>{tool.name}</Text><Text color={theme.palette.muted}> {summary}</Text>{change}<Text color={theme.palette.subtle}>{tool.durationMs !== undefined ? ` · ${tool.durationMs}ms` : ''}</Text></Text>
+      <Text color={color}>└─ {icon} <Text bold>{sanitizeTerminalText(tool.name)}</Text><Text color={theme.palette.muted}> {summary}</Text>{change}<Text color={theme.palette.subtle}>{tool.durationMs !== undefined ? ` · ${tool.durationMs}ms` : ''}</Text></Text>
       {expanded && tool.result && <Box paddingLeft={3} borderLeft borderColor={theme.palette.border}><MarkdownBlock text={tool.result} theme={theme} maxLines={14} /></Box>}
     </Box>
   );
@@ -615,13 +616,13 @@ export function CommandMenu({ items, selected, theme, maxItems = 6, width = 80, 
 }
 
 export function PermissionPrompt({ request, theme }: { request: PermissionView; theme: ResolvedTerminalTheme }): JSX.Element {
-  const args = JSON.stringify(request.args, null, 2);
+  const args = sanitizeTerminalText(JSON.stringify(request.args, null, 2));
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={theme.palette.warning} paddingX={1}>
-      <Text color={theme.palette.warning} bold>Permission required · {request.toolName}</Text>
-      {request.description && <Text color={theme.palette.muted}>{request.description}</Text>}
+      <Text color={theme.palette.warning} bold>Permission required · {sanitizeTerminalText(request.toolName)}</Text>
+      {request.description && <Text color={theme.palette.muted}>{sanitizeTerminalText(request.description)}</Text>}
       {request.reviewLines?.map((line, i) => (
-        <Text key={i} color={theme.palette.warning}>{line}</Text>
+        <Text key={i} color={theme.palette.warning}>{sanitizeTerminalText(line)}</Text>
       ))}
       <MarkdownBlock text={args} theme={theme} maxLines={10} />
       <Text><Text color={theme.palette.success}>[a] allow once</Text>  <Text color={theme.palette.accent}>[p] allow for project</Text>  <Text color={theme.palette.warning}>[g] always allow</Text>  <Text color={theme.palette.danger}>[d] deny</Text></Text>

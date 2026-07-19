@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -76,7 +76,7 @@ try {
   assert.equal(redactSensitive('password is hunter2'), 'password is [REDACTED]');
   assert.equal(redactSensitive('token was tok-was-1'), 'token was [REDACTED]');
   // FIXED: env-style names where the keyword is not adjacent to the separator.
-  assert.equal(redactSensitive('AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG'), 'AWS_SECRET_ACCESS_KEY=[REDACTED]');
+  assert.equal(redactSensitive('AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG'), 'AWS_SECRET_ACCESS_KEY=[REDACTED]'); // gitleaks:allow -- intentional redaction fixture
   // ...but uppercase counters where TOKEN is not name-final are not env secrets.
   assert.equal(redactSensitive('MAX_TOKENS=4096'), 'MAX_TOKENS=4096');
   // FIXED: bare provider keys (well-known prefixes with a long-enough tail) are
@@ -94,6 +94,10 @@ try {
   assert.match(log, /\[REDACTED\]/u);
 
   const logFile = join(dataDir, 'logs', 'hive.log');
+  if (process.platform !== 'win32') {
+    assert.equal(statSync(join(dataDir, 'logs')).mode & 0o777, 0o700);
+    assert.equal(statSync(logFile).mode & 0o777, 0o600);
+  }
 
   // --- level filtering: HIVE_DEBUG=1 enables the debug level ---
   process.env.HIVE_DEBUG = '1';

@@ -85,6 +85,34 @@ try {
   tools.saveRule({ id: randomUUID(), toolName: 'norm_tool', action: 'allow', scope: 'project', projectPath: projectA + '/' });
   assert.equal(tools.matchRule('norm_tool', {}, { cwd: projectA, conversationId: 'a' })?.action, 'allow');
   assert.equal(tools.matchRule('norm_tool', {}, { cwd: projectB, conversationId: 'b' }), null);
+
+  // A prompt resolved immediately must clear its two-minute fallback timer so
+  // short-lived CLI commands can exit without waiting for the safety timeout.
+  tools.once('request', (request: { requestId: string }) => {
+    tools.decidePermission(request.requestId, 'allow');
+  });
+  assert.equal(await tools.requestPermission(
+    { requestId: 'approve-now', toolName: 'approval-probe', args: {} },
+    { cwd: projectA, conversationId: 'approval' }
+  ), true);
+
+  // Cancellation must also settle a pending approval promptly.
+  const cancelled = new AbortController();
+  tools.once('request', () => cancelled.abort());
+  assert.equal(await tools.requestPermission(
+    { requestId: 'cancel-now', toolName: 'approval-probe', args: {} },
+    { cwd: projectA, conversationId: 'approval', signal: cancelled.signal }
+  ), false);
+
+  const preCancelled = new AbortController();
+  preCancelled.abort();
+  let emitted = false;
+  tools.once('request', () => { emitted = true; });
+  assert.equal(await tools.requestPermission(
+    { requestId: 'already-cancelled', toolName: 'approval-probe', args: {} },
+    { cwd: projectA, conversationId: 'approval', signal: preCancelled.signal }
+  ), false);
+  assert.equal(emitted, false, 'a pre-cancelled request must never reach the approval UI');
 } finally {
   closeDb();
   rmSync(dataDir, { recursive: true, force: true });

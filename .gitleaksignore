@@ -1,5 +1,6 @@
 # Gitleaks false positives — fingerprints of NON-secrets that intentionally look
 # like credentials because they exist to test secret redaction. Not real keys.
-#
-# Fake AWS_SECRET_ACCESS_KEY= string asserting logger.ts redaction behaviour.
+# The inline allow comment covers the new commit; these entries cover the two
+# historical versions that predate that annotation.
 39abe96259d2afae594232a39c9c33a896b17d80:src/main/utils/logger.test.ts:generic-api-key:79
+367ef5d4c47e78261a6a4755a0dd0ed607258d69:src/main/utils/logger.test.ts:generic-api-key:79

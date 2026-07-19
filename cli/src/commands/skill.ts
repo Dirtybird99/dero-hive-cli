@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { loadBundledSkills, loadUserSkills, inspectSkillDirectory } from '../../../src/main/skills/loader.js';
 import * as format from '../utils/format.js';
+import { sanitizeTerminalText } from '../../../src/shared/terminal.js';
 
 export function skillCommand(): Command {
   const cmd = new Command('skill').description('Manage Agent Skills');
@@ -18,11 +19,11 @@ export function skillCommand(): Command {
       }
       if (bundled.length) {
         console.log(chalk.bold('Built-in skills:'));
-        for (const s of bundled) console.log(`  ${chalk.cyan(s.slashCommand)} — ${s.description}`);
+        for (const s of bundled) console.log(`  ${chalk.cyan(sanitizeTerminalText(s.slashCommand))} — ${sanitizeTerminalText(s.description)}`);
       }
       if (user.length) {
         console.log(chalk.bold('User skills:'));
-        for (const s of user) console.log(`  ${chalk.cyan(s.slashCommand)} — ${s.description}`);
+        for (const s of user) console.log(`  ${chalk.cyan(sanitizeTerminalText(s.slashCommand))} — ${sanitizeTerminalText(s.description)}`);
       }
     });
 
@@ -36,12 +37,12 @@ export function skillCommand(): Command {
         return;
       }
       const p = result.preview;
-      console.log(`${chalk.bold(p.name)} ${chalk.gray(p.sourceDir)}`);
-      console.log(`Command: ${p.slashCommand}`);
-      console.log(`Description: ${p.description}`);
+      console.log(`${chalk.bold(sanitizeTerminalText(p.name))} ${chalk.gray(sanitizeTerminalText(p.sourceDir))}`);
+      console.log(`Command: ${sanitizeTerminalText(p.slashCommand)}`);
+      console.log(`Description: ${sanitizeTerminalText(p.description)}`);
       if (p.warnings.length) {
         console.log(chalk.yellow('Warnings:'));
-        for (const w of p.warnings) console.log(`  ${w}`);
+        for (const w of p.warnings) console.log(`  ${sanitizeTerminalText(w)}`);
       }
     });
 

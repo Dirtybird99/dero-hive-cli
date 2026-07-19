@@ -7,24 +7,35 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NPM_VERSION: 12.0.1
+
 jobs:
   verify:
-    name: ${{ matrix.os }} / npm ${{ matrix.npm }}
+    name: ${{ matrix.os }} / Node ${{ matrix.node }} / npm 12.0.1
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        npm: [10, 12]
+        node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
           cache: npm
-      - run: npm install --global npm@${{ matrix.npm }}
-      - run: npm --version
-      - run: npm ci
+      - run: npm install --global --ignore-scripts --allow-remote=all npm@${{ env.NPM_VERSION }}
+      - name: Verify npm version
+        run: node -e "const {execSync}=require('node:child_process'); const v=execSync('npm --version',{encoding:'utf8'}).trim(); if(v!==process.env.NPM_VERSION) throw new Error('Expected npm '+process.env.NPM_VERSION+', got '+v)"
+      - run: npm ci --strict-allow-scripts --allow-remote=none
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
@@ -37,23 +48,33 @@ jobs:
   quality:
     name: Coverage and MCP conformance
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
           cache: npm
-      - run: npm ci
+      - run: npm install --global --ignore-scripts --allow-remote=all npm@${{ env.NPM_VERSION }}
+      - name: Verify npm version
+        run: node -e "const {execSync}=require('node:child_process'); const v=execSync('npm --version',{encoding:'utf8'}).trim(); if(v!==process.env.NPM_VERSION) throw new Error('Expected npm '+process.env.NPM_VERSION+', got '+v)"
+      - run: npm ci --strict-allow-scripts --allow-remote=none
       - run: npm run test:coverage
       - run: npm run test:mcp-conformance
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm --prefix resources/mcp/dero-mcp-server audit --omit=dev --audit-level=high
 
   secrets:
     name: Gitleaks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

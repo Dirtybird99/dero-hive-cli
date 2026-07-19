@@ -1,12 +1,15 @@
 import React from 'react';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { render } from 'ink';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'dero-hive-tui-'));
+const alternateWorkspace = mkdtempSync(join(tmpdir(), 'dero-hive-tui-workspace-b-'));
+const relativeWorkspace = join(alternateWorkspace, 'relative-child');
+mkdirSync(relativeWorkspace);
 process.env.HIVE_DATA_DIR = dataDir;
 process.env.HIVE_APP_ROOT = resolve('.');
 process.env.HIVE_RESOURCES = resolve('resources');
@@ -114,7 +117,7 @@ secretComposer.unmount();
 await secretExited;
 
 try {
-  await initHive();
+  const hive = await initHive();
   const instance = render(React.createElement(App, { options: { cwd: resolve('.') } }), {
     stdin,
     stdout,
@@ -142,6 +145,23 @@ try {
   assert.ok(output.includes(`${escape}]10;#e1e1e1`));
   assert.ok(output.includes(`${escape}]11;#141414`));
   assert.match(output, /No provider is configured|no provider/i);
+
+  output = '';
+  const firstPermission = hive.tools.requestPermission({
+    requestId: 'fifo-first', toolName: 'first_tool', args: { marker: 'first' }
+  }, { cwd: resolve('.'), conversationId: 'fifo-test' });
+  const secondPermission = hive.tools.requestPermission({
+    requestId: 'fifo-second', toolName: 'second_tool', args: { marker: 'second' }
+  }, { cwd: resolve('.'), conversationId: 'fifo-test' });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+  assert.match(output.replace(ansiCsi, ''), /Permission required · first_tool/);
+  stdin.write('a');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+  assert.equal(await firstPermission, true);
+  assert.match(output.replace(ansiCsi, ''), /Permission required · second_tool/);
+  stdin.write('d');
+  assert.equal(await secondPermission, false, 'permission prompts resolve in FIFO order without overwriting');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 80));
 
   output = '';
   stdin.write('\u001b[A');
@@ -369,11 +389,45 @@ try {
   stdin.write('\u001b[B');
   await new Promise((resolveWait) => setTimeout(resolveWait, 80));
   assert.match(output.replace(ansiCsi, ''), /session-draft/);
+
+  // Bang-shell commands share the active AbortController. Unmounting the TUI
+  // must cancel the shell's whole process tree, not just its immediate parent.
+  const shellChild = join(dataDir, 'tui-shell-child.cjs');
+  const shellParent = join(dataDir, 'tui-shell-parent.cjs');
+  const shellReady = join(dataDir, 'tui-shell-ready.txt');
+  const shellMarker = join(dataDir, 'tui-shell-delayed-marker.txt');
+  writeFileSync(shellChild, `
+const fs = require('node:fs');
+fs.writeFileSync(process.argv[2], 'ready');
+setTimeout(() => fs.writeFileSync(process.argv[3], 'escaped'), 1200);
+setInterval(() => {}, 1000);
+`);
+  writeFileSync(shellParent, `
+const { spawn } = require('node:child_process');
+spawn(process.execPath, [${JSON.stringify(shellChild)}, process.argv[2], process.argv[3]], { stdio: 'ignore' });
+setInterval(() => {}, 1000);
+`);
+  stdin.write('\u0001');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+  stdin.write('\u001b[3~');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  const bangCommand = `!node "${shellParent}" "${shellReady}" "${shellMarker}"`;
+  for (const character of bangCommand) stdin.write(character);
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  stdin.write('\r');
+  for (let attempt = 0; attempt < 200 && !existsSync(shellReady); attempt += 1) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.equal(existsSync(shellReady), true, 'bang-shell descendant fixture must start before cancellation');
   instance.unmount();
   await exited;
+  await new Promise((resolveWait) => setTimeout(resolveWait, 1500));
+  assert.equal(existsSync(shellMarker), false, 'unmount must kill bang-shell descendants before delayed work runs');
 
   const conversations = await import('../services/conversation.js');
-  const seeded = conversations.createConversation({ title: 'Seeded parity session', providerId: 'test', model: 'test-model' });
+  const seeded = conversations.createConversation({
+    title: 'Seeded parity session', providerId: 'test', model: 'test-model', workspacePath: resolve('.')
+  });
   conversations.persistMessage(seeded.id, { id: 'seed-user', role: 'user', content: 'seeded-user-marker', createdAt: Date.now() });
   conversations.persistMessage(seeded.id, { id: 'seed-assistant', role: 'assistant', content: 'seeded-assistant-marker', createdAt: Date.now() + 1 });
   const seededApp = render(React.createElement(App, { options: { cwd: resolve('.'), conversation: seeded.id } }), {
@@ -381,6 +435,44 @@ try {
   });
   const seededExited = seededApp.waitUntilExit();
   await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+
+  const attachmentNamesBeforeSwitch = new Set(readdirSync(join(dataDir, 'attachments')));
+  for (const character of '/attach README.md') stdin.write(character);
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  stdin.write('\r');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+  const stagedAttachment = readdirSync(join(dataDir, 'attachments')).find((name) => !attachmentNamesBeforeSwitch.has(name) && /^[0-9a-f-]{36}$/iu.test(name));
+  assert.ok(stagedAttachment, 'the workspace-switch fixture must stage an attachment');
+
+  for (const character of `/cd ${alternateWorkspace}`) stdin.write(character);
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  output = '';
+  stdin.write('\r');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+  assert.match(output.replace(ansiCsi, ''), /new conversation/i);
+  const cliConfig = await import('../utils/config.js');
+  const { sameWorkspacePath } = await import('../../../src/shared/workspace.js');
+  const switchedState = cliConfig.loadState();
+  assert.notEqual(switchedState.currentConversationId, seeded.id);
+  const switchedConversation = conversations.getConversation(switchedState.currentConversationId || '');
+  assert.equal(sameWorkspacePath(switchedConversation?.workspacePath, alternateWorkspace), true);
+  assert.equal(switchedConversation?.projectId, undefined, 'unregistered workspace clears the active project id');
+  assert.equal(existsSync(join(dataDir, 'attachments', stagedAttachment)), false, 'workspace switching deletes pending attachments from the old workspace');
+
+  for (const character of '/cd relative-child') stdin.write(character);
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  stdin.write('\r');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+  const relativeState = cliConfig.loadState();
+  assert.equal(sameWorkspacePath(relativeState.currentProjectPath, relativeWorkspace), true, 'TUI relative /cd resolves from the active workspace');
+
+  for (const character of `/resume ${seeded.id}`) stdin.write(character);
+  await new Promise((resolveWait) => setTimeout(resolveWait, 60));
+  output = '';
+  stdin.write('\r');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+  assert.match(output.replace(ansiCsi, ''), /Resumed: Seeded parity session/);
+  assert.equal(cliConfig.loadState().currentConversationId, seeded.id);
 
   for (const character of '/home') stdin.write(character);
   await new Promise((resolveWait) => setTimeout(resolveWait, 60));
@@ -859,4 +951,5 @@ try {
 } finally {
   await shutdownHive();
   rmSync(dataDir, { recursive: true, force: true });
+  rmSync(alternateWorkspace, { recursive: true, force: true });
 }

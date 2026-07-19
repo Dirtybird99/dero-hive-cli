@@ -1,12 +1,14 @@
 import type { ToolDefinition, MediaKind, MediaGenerationRequest } from '@shared/types';
-import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, readdir, mkdir, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import { lookup } from 'node:dns/promises';
+import type { LookupFunction } from 'node:net';
 import ipaddr from 'ipaddr.js';
 import fg from 'fast-glob';
+import { Agent } from 'undici';
 import { resolveAndValidate } from '../utils/pathPolicy';
 import type { ToolExecutor, ToolContext, ToolResult } from './registry';
 import { getMediaManager } from '../media/instance';
@@ -16,7 +18,208 @@ import { lintDvmBasic } from '@shared/dvm';
 import type { IndexQuery } from '@shared/gnomon';
 import { diffLines, diffCounts } from '@shared/diff';
 
-const execAsync = promisify(exec);
+const SHELL_MAX_BUFFER_BYTES = 1024 * 1024;
+const SHELL_OUTPUT_BYTES = 50_000;
+const SHELL_TASKKILL_TIMEOUT_MS = 5_000;
+const SHELL_CLOSE_GRACE_MS = 1_000;
+
+type ShellStopReason = 'cancelled' | 'timeout' | 'maxBuffer';
+
+interface ShellOutcome {
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stopReason?: ShellStopReason;
+  error?: Error;
+}
+
+interface ShellProcessHooks {
+  platform: NodeJS.Platform;
+  spawnShell: (command: string, options: SpawnOptions) => ChildProcess;
+  spawnTaskkill: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
+  taskkillTimeoutMs: number;
+  closeGraceMs: number;
+}
+
+const defaultShellProcessHooks: ShellProcessHooks = {
+  platform: process.platform,
+  spawnShell: (command, options) => spawn(command, options),
+  spawnTaskkill: (command, args, options) => spawn(command, args, options),
+  taskkillTimeoutMs: SHELL_TASKKILL_TIMEOUT_MS,
+  closeGraceMs: SHELL_CLOSE_GRACE_MS
+};
+let shellProcessHooks = defaultShellProcessHooks;
+
+/** Test seam for process lifecycle failures that cannot be produced reliably on every OS. */
+export function __setShellProcessHooksForTest(hooks: Partial<ShellProcessHooks> | null): void {
+  shellProcessHooks = hooks ? { ...defaultShellProcessHooks, ...hooks } : defaultShellProcessHooks;
+}
+
+function tryKillChild(child: ChildProcess): boolean {
+  try { return child.kill('SIGKILL'); } catch { return false; }
+}
+
+function killProcessTree(child: ChildProcess): Promise<void> {
+  const pid = child.pid;
+  if (!pid) return Promise.reject(new Error('Cannot terminate process tree: child PID is unavailable.'));
+
+  if (shellProcessHooks.platform !== 'win32') {
+    try { process.kill(-pid, 'SIGKILL'); }
+    catch (error) {
+      tryKillChild(child);
+      return Promise.reject(new Error(`Failed to terminate process group ${pid}.`, { cause: error }));
+    }
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    let killer: ChildProcess;
+    try {
+      killer = shellProcessHooks.spawnTaskkill('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore'
+      });
+    } catch (error) {
+      tryKillChild(child);
+      reject(new Error(`Failed to start taskkill for process tree ${pid}.`, { cause: error }));
+      return;
+    }
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      tryKillChild(killer);
+      tryKillChild(child);
+      finish(new Error(`taskkill did not settle within ${shellProcessHooks.taskkillTimeoutMs}ms for process tree ${pid}.`));
+    }, shellProcessHooks.taskkillTimeoutMs);
+    killer.once('error', (error) => {
+      tryKillChild(child);
+      finish(new Error(`taskkill failed for process tree ${pid}: ${error.message}`, { cause: error }));
+    });
+    killer.once('close', (code, signal) => {
+      if (code === 0) finish();
+      else {
+        tryKillChild(child);
+        finish(new Error(`taskkill failed for process tree ${pid} (exit ${code ?? 'unknown'}${signal ? `, signal ${signal}` : ''}).`));
+      }
+    });
+  });
+}
+
+function runShellProcess(command: string, cwd: string, timeout: number, signal?: AbortSignal): Promise<ShellOutcome> {
+  return new Promise((resolve) => {
+    const child = shellProcessHooks.spawnShell(command, {
+      cwd,
+      shell: shellProcessHooks.platform === 'win32' ? 'powershell.exe' : '/bin/sh',
+      detached: shellProcessHooks.platform !== 'win32',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let totalBytes = 0;
+    let stopReason: ShellStopReason | undefined;
+    let termination: Promise<void> | undefined;
+    let spawnError: Error | undefined;
+    let closeSeen = false;
+    let closeCode: number | null = null;
+    let closeSignal: NodeJS.Signals | null = null;
+    let settled = false;
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((done) => { resolveClosed = done; });
+
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      if (!closeSeen) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.unref?.();
+      }
+      resolve({
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+        code: closeCode,
+        signal: closeSignal,
+        stopReason,
+        error: error ?? spawnError
+      });
+    };
+
+    const settleStoppedProcess = async (): Promise<void> => {
+      let terminationError: Error | undefined;
+      try { await termination; }
+      catch (error) { terminationError = error instanceof Error ? error : new Error(String(error)); }
+      if (!closeSeen) {
+        let graceTimer!: NodeJS.Timeout;
+        await Promise.race([
+          closed,
+          new Promise<void>((done) => { graceTimer = setTimeout(done, shellProcessHooks.closeGraceMs); })
+        ]);
+        clearTimeout(graceTimer);
+      }
+      if (!closeSeen) {
+        tryKillChild(child);
+        terminationError ??= new Error(`Process did not close within ${shellProcessHooks.closeGraceMs}ms after tree termination.`);
+      }
+      finish(terminationError);
+    };
+
+    const stop = (reason: ShellStopReason): void => {
+      if (stopReason) return;
+      stopReason = reason;
+      termination = killProcessTree(child);
+      void settleStoppedProcess();
+    };
+    const capture = (target: Buffer[], retained: number, chunk: Buffer): number => {
+      totalBytes += chunk.byteLength;
+      if (retained < SHELL_OUTPUT_BYTES) {
+        const kept = chunk.subarray(0, SHELL_OUTPUT_BYTES - retained);
+        target.push(kept);
+        retained += kept.byteLength;
+      }
+      if (totalBytes > SHELL_MAX_BUFFER_BYTES) stop('maxBuffer');
+      return retained;
+    };
+    const onAbort = (): void => stop('cancelled');
+    const timer = setTimeout(() => stop('timeout'), timeout);
+
+    child.stdout?.on('data', (chunk: Buffer) => { stdoutBytes = capture(stdout, stdoutBytes, chunk); });
+    child.stderr?.on('data', (chunk: Buffer) => { stderrBytes = capture(stderr, stderrBytes, chunk); });
+    child.once('error', (error) => {
+      spawnError = error;
+      finish(error);
+    });
+    child.once('close', (code, exitSignal) => {
+      closeSeen = true;
+      closeCode = code;
+      closeSignal = exitSignal;
+      resolveClosed();
+      if (!stopReason) finish();
+    });
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+function shellOutput(stdout: string, stderr: string): string {
+  return `${stdout}${stderr ? `\n[stderr]\n${stderr}` : ''}`.trim();
+}
+
+function cappedShellResult(prefix: string, output = '', detail = ''): string {
+  return [prefix, output, detail].filter(Boolean).join('\n').trim().slice(0, SHELL_OUTPUT_BYTES);
+}
 
 function safeResolve(p: string, cwd: string): string {
   return resolveAndValidate(p, cwd);
@@ -28,6 +231,109 @@ function safeResolve(p: string, cwd: string): string {
 // marker the UI can show. The numbers are intentionally generous because the
 // diff is the most useful signal in the activity log.
 const DIFF_SNAPSHOT_MAX_BYTES = 50_000;
+const MAX_READ_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_BASE64_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_FILE_WRITE_BYTES = 5 * 1024 * 1024;
+const MAX_TOOL_TEXT_BYTES = 200_000;
+const MAX_GREP_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_SIMULATOR_RPC_BYTES = 1024 * 1024;
+const GREP_REGEX_TIMEOUT_MS = 5_000;
+
+interface RegexWorkerSession {
+  search(text: string, limit: number): Promise<number[]>;
+  close(): Promise<void>;
+}
+
+function startRegexWorker(pattern: string, signal?: AbortSignal): RegexWorkerSession {
+  const worker = new Worker(`
+const { parentPort, workerData } = require('node:worker_threads');
+const expression = new RegExp(workerData.pattern, 'm');
+parentPort.on('message', ({ id, text, limit }) => {
+  const lines = text.split('\\n');
+  const matches = [];
+  for (let index = 0; index < lines.length && matches.length < limit; index++) {
+    expression.lastIndex = 0;
+    if (expression.test(lines[index])) matches.push(index);
+  }
+  parentPort.postMessage({ id, matches });
+});
+`, { eval: true, workerData: { pattern } });
+  let sequence = 0;
+  let pending: { id: number; resolve(value: number[]): void; reject(error: Error): void } | null = null;
+  let failure: Error | null = null;
+  let closed = false;
+  const fail = (error: Error): void => {
+    failure ||= error;
+    if (pending) {
+      const active = pending;
+      pending = null;
+      active.reject(failure);
+    }
+  };
+  const onAbort = (): void => {
+    fail(new Error('Search cancelled.'));
+    void worker.terminate();
+  };
+  const timer = setTimeout(() => {
+    fail(new Error(`Regular-expression search exceeded ${GREP_REGEX_TIMEOUT_MS}ms.`));
+    void worker.terminate();
+  }, GREP_REGEX_TIMEOUT_MS);
+  timer.unref?.();
+  worker.on('message', (message: { id: number; matches: number[] }) => {
+    if (!pending || pending.id !== message.id) return;
+    const active = pending;
+    pending = null;
+    active.resolve(message.matches);
+  });
+  worker.once('error', (error) => fail(error));
+  worker.once('exit', (code) => {
+    if (!closed && code !== 0 && !failure) fail(new Error(`Regular-expression worker exited with code ${code}.`));
+  });
+  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) onAbort();
+
+  return {
+    search(text, limit) {
+      if (failure) return Promise.reject(failure);
+      if (pending) return Promise.reject(new Error('Regular-expression worker is already busy.'));
+      const id = ++sequence;
+      return new Promise<number[]>((resolve, reject) => {
+        pending = { id, resolve, reject };
+        worker.postMessage({ id, text, limit });
+      });
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      fail(new Error('Regular-expression worker closed.'));
+      await worker.terminate();
+    }
+  };
+}
+
+function simulatorRpcEndpoint(): string {
+  const configured = process.env.HIVE_SIMULATOR_RPC_URL?.trim();
+  if (!configured) return 'http://127.0.0.1:20000/json_rpc';
+  const url = new URL(configured);
+  if (url.protocol !== 'http:' || url.username || url.password || !['127.0.0.1', '[::1]'].includes(url.hostname)) {
+    throw new Error('HIVE_SIMULATOR_RPC_URL must be an unauthenticated numeric loopback HTTP URL.');
+  }
+  return url.toString();
+}
+
+function boundedText(text: string, maxBytes = MAX_TOOL_TEXT_BYTES): { text: string; truncated: boolean } {
+  const encoded = Buffer.from(text, 'utf8');
+  if (encoded.length <= maxBytes) return { text, truncated: false };
+  return { text: encoded.subarray(0, maxBytes).toString('utf8').replace(/\uFFFD$/u, ''), truncated: true };
+}
+
+function unsafeSearchPattern(pattern: string): boolean {
+  return pattern.length > 500
+    || /\\[1-9]/u.test(pattern)
+    || /\((?:[^()\\]|\\.)*[*+{](?:[^()\\]|\\.)*\)\s*[*+{]/u.test(pattern);
+}
 
 function snapshotForDiff(content: string): { text: string; truncated: boolean } {
   if (content.length <= DIFF_SNAPSHOT_MAX_BYTES) return { text: content, truncated: false };
@@ -134,7 +440,7 @@ const SHELL_DEF: ToolDefinition = {
     properties: {
       command: { type: 'string' },
       cwd: { type: 'string' },
-      timeout_ms: { type: 'integer', default: 30_000 }
+      timeout_ms: { type: 'integer', minimum: 100, maximum: 300_000, default: 30_000 }
     },
     required: ['command']
   }
@@ -592,29 +898,39 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
     if (!existsSync(abs)) return { content: `Error: file not found: ${abs}`, isError: true };
 
     const enc = encoding || 'utf-8';
+    const size = (await stat(abs)).size;
     if (enc === 'base64') {
+      if (size > MAX_BASE64_FILE_BYTES) return { content: `Error: base64 reads are limited to ${MAX_BASE64_FILE_BYTES} bytes.`, isError: true };
       const buf = await readFile(abs);
       return { content: buf.toString('base64') };
     }
+    if (size > MAX_READ_FILE_BYTES) return { content: `Error: text reads are limited to ${MAX_READ_FILE_BYTES} bytes. Use a narrower external tool.`, isError: true };
     const text = await readFile(abs, 'utf-8');
     const lines = text.split('\n');
     if (start_line || end_line) {
       const start = (start_line || 1) - 1;
       const end = end_line || lines.length;
-      return { content: lines.slice(start, end).join('\n'), meta: { totalLines: lines.length, range: [start + 1, end] } };
+      const selected = boundedText(lines.slice(start, end).join('\n'));
+      return {
+        content: selected.text + (selected.truncated ? `\n\n... [truncated at ${MAX_TOOL_TEXT_BYTES} bytes]` : ''),
+        meta: { totalLines: lines.length, range: [start + 1, end], truncated: selected.truncated }
+      };
     }
-    if (lines.length > 2000) {
-      return { content: lines.slice(0, 2000).join('\n') + `\n\n... [truncated, ${lines.length} total lines. Use start_line/end_line to read more.]` };
-    }
-    return { content: text };
+    const selected = boundedText(lines.slice(0, 2000).join('\n'));
+    const truncated = lines.length > 2000 || selected.truncated;
+    return { content: selected.text + (truncated ? `\n\n... [truncated; ${lines.length} total lines. Use start_line/end_line to read more.]` : '') };
   },
 
   async write_file(args, ctx) {
     const { path, content } = args as { path: string; content: string };
     const abs = safeResolve(path, ctx.cwd);
+    if (typeof content !== 'string' || Buffer.byteLength(content, 'utf8') > MAX_FILE_WRITE_BYTES) {
+      return { content: `Error: writes are limited to ${MAX_FILE_WRITE_BYTES} bytes.`, isError: true };
+    }
     let prevText = '';
     let isNewFile = true;
     try {
+      if ((await stat(abs)).size > MAX_READ_FILE_BYTES) return { content: `Error: existing file exceeds the ${MAX_READ_FILE_BYTES} byte edit limit.`, isError: true };
       prevText = await readFile(abs, 'utf-8');
       isNewFile = false;
     } catch { /* new file */ }
@@ -645,6 +961,10 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
   async edit_file(args, ctx) {
     const { path, old_text, new_text } = args as { path: string; old_text: string; new_text: string };
     const abs = safeResolve(path, ctx.cwd);
+    if (typeof old_text !== 'string' || typeof new_text !== 'string' || Buffer.byteLength(new_text, 'utf8') > MAX_FILE_WRITE_BYTES) {
+      return { content: `Error: edits require text and replacement content is limited to ${MAX_FILE_WRITE_BYTES} bytes.`, isError: true };
+    }
+    if ((await stat(abs)).size > MAX_READ_FILE_BYTES) return { content: `Error: file exceeds the ${MAX_READ_FILE_BYTES} byte edit limit.`, isError: true };
     const text = await readFile(abs, 'utf-8');
     const occurrences = text.split(old_text).length - 1;
     if (occurrences === 0) return { content: `Error: old_text not found in ${abs}`, isError: true };
@@ -698,41 +1018,64 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
       .filter((e) => !e.name.startsWith('.') || e.name === '.gitignore' || e.name === '.env.example')
       .map((e) => `${e.isDirectory() ? 'd' : 'f'}  ${e.name}`)
       .sort();
-    return { content: out.join('\n') || '(empty)' };
+    return { content: out.slice(0, 1_000).join('\n') + (out.length > 1_000 ? `\n... [${out.length - 1_000} more]` : '') || '(empty)' };
   },
 
   async glob_files(args, ctx) {
     const { pattern, cwd, ignore } = args as { pattern: string; cwd?: string; ignore?: string[] };
     const base = cwd ? safeResolve(cwd, ctx.cwd) : ctx.cwd;
-    const matches = await fg(pattern, { cwd: base, ignore: ignore || ['**/node_modules/**', '**/.git/**', '**/dist/**'], dot: false });
+    const matches = await fg(pattern, {
+      cwd: base,
+      ignore: ignore || ['**/node_modules/**', '**/.git/**', '**/dist/**'],
+      dot: false,
+      followSymbolicLinks: false
+    });
     return { content: matches.slice(0, 500).join('\n') + (matches.length > 500 ? `\n... [${matches.length - 500} more]` : '') };
   },
 
   async grep_files(args, ctx) {
     const { pattern, cwd, include, ignore, max_results } = args as { pattern: string; cwd?: string; include?: string; ignore?: string[]; max_results?: number };
     const base = cwd ? safeResolve(cwd, ctx.cwd) : ctx.cwd;
+    if (typeof pattern !== 'string' || unsafeSearchPattern(pattern)) {
+      return { content: 'Search pattern is missing, too long, or potentially unsafe.', isError: true };
+    }
     const matches = await fg(include || '**/*', {
       cwd: base,
       ignore: ignore || ['**/node_modules/**', '**/.git/**', '**/dist/**'],
-      absolute: false
+      absolute: false,
+      followSymbolicLinks: false
     });
-    const re = new RegExp(pattern, 'gm');
+    try { void new RegExp(pattern, 'm'); } catch {
+      return { content: 'Search pattern is not a valid regular expression.', isError: true };
+    }
     const out: string[] = [];
-    const limit = max_results || 100;
-    for (const file of matches) {
-      const abs = join(base, file);
-      let content: string;
-      try { content = await readFile(abs, 'utf-8'); } catch { continue; }
-      const lines = content.split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (re.test(line)) {
-          out.push(`${file}:${i + 1}:${line}`);
-          if (out.length >= limit) break;
+    const limit = Math.min(1_000, Math.max(1, Math.floor(max_results || 100)));
+    const regex = startRegexWorker(pattern, ctx.signal);
+    try {
+      for (const file of matches.slice(0, 10_000)) {
+        if (ctx.signal?.aborted) throw new Error('Search cancelled.');
+        let abs: string;
+        try { abs = safeResolve(file, base); } catch { continue; }
+        let content: string;
+        try {
+          if ((await stat(abs)).size > MAX_GREP_FILE_BYTES) continue;
+          content = await readFile(abs, 'utf-8');
+        } catch { continue; }
+        const remaining = limit - out.length;
+        const lineNumbers = await regex.search(content, remaining);
+        if (lineNumbers.length) {
+          const lines = content.split('\n');
+          for (const index of lineNumbers) out.push(`${file}:${index + 1}:${lines[index]}`);
         }
-        re.lastIndex = 0;
+        if (out.length >= limit) { out.push(`... [truncated at ${limit}]`); break; }
       }
-      if (out.length >= limit) { out.push(`... [truncated at ${limit}]`); break; }
+    } catch (error) {
+      return {
+        content: ctx.signal?.aborted ? '[cancelled] Search was cancelled.' : error instanceof Error ? error.message : String(error),
+        isError: true
+      };
+    } finally {
+      await regex.close();
     }
     return { content: out.join('\n') || '(no matches)' };
   },
@@ -740,31 +1083,41 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
   async run_shell(args, ctx) {
     const { command, cwd, timeout_ms } = args as { command: string; cwd?: string; timeout_ms?: number };
     const base = cwd ? safeResolve(cwd, ctx.cwd) : ctx.cwd;
-    const timeout = timeout_ms || 30_000;
+    const timeout = timeout_ms ?? 30_000;
+    if (!Number.isInteger(timeout) || timeout < 100 || timeout > 300_000) {
+      return { content: 'timeout_ms must be an integer between 100 and 300000.', isError: true };
+    }
     // An already-cancelled request never spawns a process at all.
     if (ctx.signal?.aborted) {
       return { content: '[cancelled] Command was cancelled before it started.', isError: true };
     }
     try {
-      const { stdout, stderr } = await execAsync(command, {
-        cwd: base,
-        timeout,
-        maxBuffer: 10 * 1024 * 1024,
-        shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh',
-        // exec kills the child itself when the signal aborts, so no manual
-        // abort listener is needed and nothing outlives the tool call.
-        signal: ctx.signal
-      });
-      const out = (stdout + (stderr ? `\n[stderr]\n${stderr}` : '')).trim();
-      return { content: out.slice(0, 50_000) || '(no output)' };
-    } catch (err) {
-      const e = err as { stdout?: string; stderr?: string; message?: string };
-      // Abort mid-run: exec has already killed the child; surface a
-      // cancellation result (with any captured output) instead of an exit code.
-      if (ctx.signal?.aborted) {
-        return { content: `[cancelled]\n${e.stdout || ''}${e.stderr ? '\n[stderr]\n' + e.stderr : ''}`.trim(), isError: true };
+      const outcome = await runShellProcess(command, base, timeout, ctx.signal);
+      const output = shellOutput(outcome.stdout, outcome.stderr);
+      if (outcome.stopReason === 'cancelled') {
+        return { content: cappedShellResult('[cancelled]', output, outcome.error?.message), isError: true };
       }
-      return { content: `[exit ${(err as { code?: number }).code ?? 'err'}]\n${e.stdout || ''}${e.stderr ? '\n[stderr]\n' + e.stderr : ''}\n${e.message || ''}`, isError: true };
+      if (outcome.stopReason === 'timeout') {
+        return {
+          content: cappedShellResult('[exit err]', output, [`Command timed out after ${timeout}ms.`, outcome.error?.message].filter(Boolean).join('\n')),
+          isError: true
+        };
+      }
+      if (outcome.stopReason === 'maxBuffer') {
+        return {
+          content: cappedShellResult(`[exit err] Command output exceeded ${SHELL_MAX_BUFFER_BYTES} bytes.`, output, outcome.error?.message),
+          isError: true
+        };
+      }
+      if (outcome.error || outcome.code !== 0) {
+        return {
+          content: cappedShellResult(`[exit ${outcome.code ?? 'err'}]`, output, outcome.error?.message || (outcome.signal ? `Killed by ${outcome.signal}.` : '')),
+          isError: true
+        };
+      }
+      return { content: output.slice(0, SHELL_OUTPUT_BYTES) || '(no output)' };
+    } catch (err) {
+      return { content: cappedShellResult('[exit err]', '', err instanceof Error ? err.message : String(err)), isError: true };
     }
   },
 
@@ -777,24 +1130,35 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
     const blocked = isBlockedUrl(url);
     if (blocked.blocked) return { content: `Refusing to fetch ${url}: ${blocked.reason}`, isError: true };
     try {
-      const res = await fetchWithRedirectGuard(url, ctx.signal, WEB_FETCH_TIMEOUT_MS);
-      const contentType = res.headers.get('content-type') || '';
-      const isText = /^(text\/|application\/(json|xml|xhtml|javascript|ld\+json)|application\/[^;]*\+(json|xml))/i.test(contentType);
-      if (!isText) {
-        const len = res.headers.get('content-length');
+      const guarded = await fetchWithRedirectGuard(url, ctx.signal, webFetchTimeoutMs);
+      try {
+        const { response: res } = guarded;
+        const contentType = res.headers.get('content-type') || '';
+        const isText = /^(text\/|application\/(json|xml|xhtml|javascript|ld\+json)|application\/[^;]*\+(json|xml))/i.test(contentType);
+        if (!isText) {
+          const len = res.headers.get('content-length');
+          await res.body?.cancel();
+          return {
+            content: `[${res.status}] ${guarded.url}\nNon-text content (${contentType || 'unknown type'}${len ? `, ${len} bytes` : ''}); body omitted.`,
+            meta: { url: guarded.url, status: res.status, contentType }
+          };
+        }
+        const bodyResult = await readLimitedBody(res, maxBytes, guarded.signal);
+        const body = /html/i.test(contentType) ? htmlToText(bodyResult.text) : bodyResult.text;
+        const out = bodyResult.truncated ? `${body}\n\n... [truncated at ${maxBytes} bytes]` : body;
         return {
-          content: `[${res.status}] ${res.url}\nNon-text content (${contentType || 'unknown type'}${len ? `, ${len} bytes` : ''}); body omitted.`,
-          meta: { url: res.url, status: res.status, contentType }
+          content: `[${res.status}] ${guarded.url}\n\n${out}`.trim(),
+          meta: {
+            url: guarded.url,
+            status: res.status,
+            contentType,
+            bytes: bodyResult.bytes,
+            truncated: bodyResult.truncated
+          }
         };
+      } finally {
+        await guarded.cleanup();
       }
-      const raw = await res.text();
-      const body = /html/i.test(contentType) ? htmlToText(raw) : raw;
-      const truncated = body.length > maxBytes;
-      const out = truncated ? body.slice(0, maxBytes) + `\n\n... [truncated at ${maxBytes} chars]` : body;
-      return {
-        content: `[${res.status}] ${res.url}\n\n${out}`.trim(),
-        meta: { url: res.url, status: res.status, contentType, bytes: raw.length, truncated }
-      };
     } catch (err) {
       if (ctx.signal?.aborted) return { content: '[cancelled] Fetch was cancelled.', isError: true };
       return { content: `Fetch failed: ${err instanceof Error ? err.message : String(err)}`, isError: true };
@@ -846,15 +1210,17 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
     };
   },
 
-  async get_simulator_chain_info() {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3_000);
+  async get_simulator_chain_info(_args, ctx) {
     try {
-      const response = await fetch('http://127.0.0.1:20000/json_rpc', {
-        method: 'POST', headers: { 'content-type': 'application/json' }, signal: controller.signal,
+      const timeoutSignal = AbortSignal.timeout(3_000);
+      const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeoutSignal]) : timeoutSignal;
+      const response = await fetch(simulatorRpcEndpoint(), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, signal,
         body: JSON.stringify({ jsonrpc: '2.0', id: 'dero-hive-tool', method: 'DERO.GetInfo' })
       });
-      const body = await response.json() as { result?: Record<string, unknown>; error?: { message?: string } };
+      const payload = await readLimitedBody(response, MAX_SIMULATOR_RPC_BYTES, signal);
+      if (payload.truncated) return { content: 'Error: simulator RPC response exceeds 1 MB.', isError: true };
+      const body = JSON.parse(payload.text) as { result?: Record<string, unknown>; error?: { message?: string } };
       if (!response.ok || body.error || !body.result) return { content: `Error: ${body.error?.message || `Simulator RPC HTTP ${response.status}`}`, isError: true };
       const result = body.result;
       const summary = {
@@ -864,7 +1230,7 @@ export const builtinExecutors: Record<string, ToolExecutor> = {
       return { content: JSON.stringify(summary, null, 2), meta: { simulator: summary } };
     } catch (error) {
       return { content: `Error: local simulator unavailable: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-    } finally { clearTimeout(timeout); }
+    }
   },
 
   async simulator_create_wallet() {
@@ -1151,7 +1517,7 @@ async function runMediaGeneration(
   }
 
   try {
-    const art = await mgr.generate(req, { conversationId: ctx.conversationId });
+    const art = await mgr.generate(req, { conversationId: ctx.conversationId, signal: ctx.signal });
     if (process.env.HIVE_CLI) {
       const copied = await mgr.copyArtifactToProject(art.id, ctx.cwd, 'hive');
       return {
@@ -1178,8 +1544,16 @@ async function runMediaGeneration(
 
 // ── Web tools (web_fetch / web_search) ────────────────────────────────
 const WEB_FETCH_TIMEOUT_MS = 15_000;
+const WEB_SEARCH_MAX_BODY_BYTES = 1_000_000;
 const WEB_USER_AGENT = 'Mozilla/5.0 (compatible; DeroHive/1.0; +https://dero.io)';
 const MAX_REDIRECTS = 5;
+let webFetchTimeoutMs = WEB_FETCH_TIMEOUT_MS;
+
+/** Test seam for exercising post-header body timeouts without a 15-second wait. */
+export function __setWebFetchTimeoutForTest(timeoutMs: number | null): void {
+  if (timeoutMs !== null && (!Number.isInteger(timeoutMs) || timeoutMs < 1)) throw new Error('timeoutMs must be a positive integer.');
+  webFetchTimeoutMs = timeoutMs ?? WEB_FETCH_TIMEOUT_MS;
+}
 
 export interface WebSearchResult {
   title: string;
@@ -1275,14 +1649,56 @@ async function assertHostResolvesPublic(host: string): Promise<void> {
   }
 }
 
-/** Fetch following redirects manually so each hop is re-validated against isBlockedUrl,
- *  and DNS-name hosts are resolved and re-checked before each connection. */
-async function fetchWithRedirectGuard(startUrl: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<Response> {
+function publicLookup(): LookupFunction {
+  return (hostname, options, callback) => {
+    resolveHostAddresses(hostname).then((addresses) => {
+      if (!addresses.length) throw new Error(`host ${hostname} resolved to no addresses`);
+      for (const address of addresses) {
+        if (isBlockedAddress(address)) {
+          throw new Error(`host ${hostname} resolves to a non-public address (${address})`);
+        }
+      }
+      const records = addresses.map((address) => ({
+        address,
+        family: ipaddr.parse(address).kind() === 'ipv4' ? 4 : 6
+      }));
+      const requestedFamily = options.family === 4 || options.family === 6 ? options.family : undefined;
+      const eligible = requestedFamily ? records.filter((record) => record.family === requestedFamily) : records;
+      if (!eligible.length) throw new Error(`host ${hostname} has no IPv${requestedFamily} address`);
+      if (options.all) callback(null, eligible);
+      else callback(null, eligible[0].address, eligible[0].family);
+    }).catch((error: unknown) => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      callback(Object.assign(err, { code: 'EHOSTUNREACH' }), '');
+    });
+  };
+}
+
+interface GuardedFetch {
+  response: Response;
+  url: string;
+  signal: AbortSignal;
+  cleanup: () => Promise<void>;
+}
+
+/** Fetch following redirects manually. The dispatcher's lookup validates the
+ * exact address used for each connection, closing the DNS rebinding window. */
+async function fetchWithRedirectGuard(startUrl: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<GuardedFetch> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const onAbort = (): void => controller.abort();
+  const timer = setTimeout(() => controller.abort(new Error(`Fetch timed out after ${timeoutMs}ms.`)), timeoutMs);
+  timer.unref?.();
+  const onAbort = (): void => controller.abort(signal?.reason);
+  const dispatcher = new Agent({ connect: { lookup: publicLookup() } });
+  let cleaned = false;
+  const cleanup = async (): Promise<void> => {
+    if (cleaned) return;
+    cleaned = true;
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+    try { await dispatcher.close(); } catch { /* best effort */ }
+  };
   if (signal) {
-    if (signal.aborted) controller.abort();
+    if (signal.aborted) controller.abort(signal.reason);
     else signal.addEventListener('abort', onAbort, { once: true });
   }
   try {
@@ -1297,21 +1713,62 @@ async function fetchWithRedirectGuard(startUrl: string, signal: AbortSignal | un
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal,
-        headers: { 'user-agent': WEB_USER_AGENT, accept: 'text/html,application/json;q=0.9,*/*;q=0.8' }
-      });
+        headers: { 'user-agent': WEB_USER_AGENT, accept: 'text/html,application/json;q=0.9,*/*;q=0.8' },
+        dispatcher
+      } as RequestInit & { dispatcher: Agent });
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get('location');
-        if (!loc) return res;
+        if (!loc) return { response: res, url, signal: controller.signal, cleanup };
+        await res.body?.cancel();
         url = new URL(loc, url).toString();
         continue;
       }
-      return res;
+      return { response: res, url, signal: controller.signal, cleanup };
     }
     throw new Error(`too many redirects (>${MAX_REDIRECTS})`);
-  } finally {
-    clearTimeout(timer);
-    if (signal) signal.removeEventListener('abort', onAbort);
+  } catch (error) {
+    await cleanup();
+    throw error;
   }
+}
+
+async function readLimitedBody(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal
+): Promise<{ text: string; bytes: number; truncated: boolean }> {
+  const reader = response.body?.getReader();
+  if (!reader) return { text: '', bytes: 0, truncated: false };
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let truncated = false;
+  let rejectAbort!: (error: Error) => void;
+  const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+  const onAbort = (): void => rejectAbort(signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('Fetch was cancelled.', 'AbortError'));
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    if (signal.aborted) onAbort();
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) break;
+      if (!value?.byteLength) continue;
+      const remaining = maxBytes + 1 - bytes;
+      if (remaining <= 0) { truncated = true; break; }
+      const chunk = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+      chunks.push(chunk);
+      bytes += chunk.byteLength;
+      if (bytes > maxBytes) { truncated = true; break; }
+    }
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    if (truncated || signal.aborted) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+    }
+  }
+  const raw = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).subarray(0, maxBytes);
+  return { text: raw.toString('utf8'), bytes: raw.byteLength, truncated };
 }
 
 /** Reduce an HTML document to readable text: drop script/style/comments, turn block
@@ -1352,9 +1809,9 @@ async function runWebSearch(query: string, count: number, signal: AbortSignal | 
 
 async function braveSearch(query: string, count: number, apiKey: string, signal: AbortSignal | undefined): Promise<WebSearchResult[]> {
   const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`;
-  const res = await timedFetch(url, { headers: { accept: 'application/json', 'x-subscription-token': apiKey } }, signal);
-  if (!res.ok) throw new Error(`Brave search HTTP ${res.status}`);
-  const body = await res.json() as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
+  const { response, text } = await timedFetchText(url, { headers: { accept: 'application/json', 'x-subscription-token': apiKey } }, signal);
+  if (!response.ok) throw new Error(`Brave search HTTP ${response.status}`);
+  const body = JSON.parse(text) as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
   return (body.web?.results || []).slice(0, count).map((r) => ({
     title: r.title || r.url || '(untitled)',
     url: r.url || '',
@@ -1363,13 +1820,13 @@ async function braveSearch(query: string, count: number, apiKey: string, signal:
 }
 
 async function tavilySearch(query: string, count: number, apiKey: string, signal: AbortSignal | undefined): Promise<WebSearchResult[]> {
-  const res = await timedFetch('https://api.tavily.com/search', {
+  const { response, text } = await timedFetchText('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ api_key: apiKey, query, max_results: count })
   }, signal);
-  if (!res.ok) throw new Error(`Tavily search HTTP ${res.status}`);
-  const body = await res.json() as { results?: Array<{ title?: string; url?: string; content?: string }> };
+  if (!response.ok) throw new Error(`Tavily search HTTP ${response.status}`);
+  const body = JSON.parse(text) as { results?: Array<{ title?: string; url?: string; content?: string }> };
   return (body.results || []).slice(0, count).map((r) => ({
     title: r.title || r.url || '(untitled)',
     url: r.url || '',
@@ -1379,9 +1836,9 @@ async function tavilySearch(query: string, count: number, apiKey: string, signal
 
 async function duckDuckGoSearch(query: string, count: number, signal: AbortSignal | undefined): Promise<WebSearchResult[]> {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const res = await timedFetch(url, { headers: { 'user-agent': WEB_USER_AGENT, accept: 'text/html' } }, signal);
-  if (!res.ok) throw new Error(`DuckDuckGo HTTP ${res.status}`);
-  return parseDuckDuckGoHtml(await res.text()).slice(0, count);
+  const { response, text } = await timedFetchText(url, { headers: { 'user-agent': WEB_USER_AGENT, accept: 'text/html' } }, signal);
+  if (!response.ok) throw new Error(`DuckDuckGo HTTP ${response.status}`);
+  return parseDuckDuckGoHtml(text).slice(0, count);
 }
 
 /** Parse DuckDuckGo's HTML results page into structured results. Exported for tests. */
@@ -1416,16 +1873,24 @@ function stripTags(s: string): string {
   return decodeEntities(s.replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
 }
 
-async function timedFetch(url: string, init: RequestInit, signal: AbortSignal | undefined): Promise<Response> {
+async function timedFetchText(
+  url: string,
+  init: RequestInit,
+  signal: AbortSignal | undefined
+): Promise<{ response: Response; text: string }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), WEB_FETCH_TIMEOUT_MS);
-  const onAbort = (): void => controller.abort();
+  const timeoutMs = webFetchTimeoutMs;
+  const timer = setTimeout(() => controller.abort(new Error(`Search timed out after ${timeoutMs}ms.`)), timeoutMs);
+  const onAbort = (): void => controller.abort(signal?.reason);
   if (signal) {
-    if (signal.aborted) controller.abort();
+    if (signal.aborted) controller.abort(signal.reason);
     else signal.addEventListener('abort', onAbort, { once: true });
   }
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const body = await readLimitedBody(response, WEB_SEARCH_MAX_BODY_BYTES, controller.signal);
+    if (body.truncated) throw new Error(`Search response exceeded ${WEB_SEARCH_MAX_BODY_BYTES} bytes.`);
+    return { response, text: body.text };
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener('abort', onAbort);

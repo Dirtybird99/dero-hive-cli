@@ -428,6 +428,7 @@ export interface Conversation {
   pinned?: boolean;
   archived?: boolean;
   projectId?: string;
+  workspacePath?: string;
   parentId?: string;
   totalTokens?: number;
   messageCount: number;
@@ -439,7 +440,7 @@ export interface Conversation {
 
 export interface PermissionRule {
   id: string;
-  toolName: string; // 'bash' | 'write_file' | 'mcp:server.tool' | '*'
+  toolName: string; // 'run_shell' | 'write_file' | 'mcp:<server-id>:<tool-name>' | '*'
   pattern?: string; // glob or regex
   action: 'allow' | 'deny' | 'ask';
   scope?: 'project' | 'global';

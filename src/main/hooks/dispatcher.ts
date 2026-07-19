@@ -1,9 +1,11 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { getSetting } from '../db/client';
 import { logger } from '../utils/logger';
 import type { HookContext, HookDefinition, HookEvent } from './types';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
+const MAX_HOOK_OUTPUT_BYTES = 256 * 1024;
+const TREE_KILL_TIMEOUT_MS = 5_000;
 
 export interface PreToolUseOutcome {
   block: boolean;
@@ -45,10 +47,24 @@ function filterHooks(hooks: HookDefinition[], event: HookEvent, toolName: string
 function runHookCommand(hook: HookDefinition, payload: string): Promise<HookRunOutcome> {
   const timeoutMs = hook.timeoutMs && hook.timeoutMs > 0 ? hook.timeoutMs : DEFAULT_TIMEOUT_MS;
   return new Promise<HookRunOutcome>((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(hook.command, {
+        shell: true,
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+    } catch (err) {
+      resolve({ errored: true, feedback: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+
     let settled = false;
-    let timedOut = false;
-    let stdout = '';
-    let stderr = '';
+    let stopping = false;
+    let outputBytes = 0;
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
 
     const finish = (outcome: HookRunOutcome): void => {
       if (settled) return;
@@ -57,36 +73,47 @@ function runHookCommand(hook: HookDefinition, payload: string): Promise<HookRunO
       resolve(outcome);
     };
 
-    let child;
-    try {
-      child = spawn(hook.command, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch (err) {
-      return finish({ errored: true, feedback: err instanceof Error ? err.message : String(err) });
-    }
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      // Resolve immediately rather than waiting for 'close': with shell:true a
-      // grandchild process can hold the stdio pipes open past kill(), so 'close'
-      // may not fire for a long time. Best-effort terminate + detach the streams
-      // so a runaway hook can never hang the caller.
-      finish({ errored: true, feedback: `hook timed out after ${timeoutMs}ms` });
-      killTree(child);
+    const stop = async (feedback: string): Promise<void> => {
+      if (stopping || settled) return;
+      stopping = true;
+      let terminationError: string | undefined;
+      try { await killTree(child); }
+      catch (error) { terminationError = error instanceof Error ? error.message : String(error); }
       child.stdout?.destroy();
       child.stderr?.destroy();
       child.stdin?.destroy();
       child.unref();
+      finish({ errored: true, feedback: terminationError ? `${feedback}; ${terminationError}` : feedback });
+    };
+
+    const capture = (target: Buffer[], chunk: Buffer): void => {
+      if (stopping || settled) return;
+      const remaining = MAX_HOOK_OUTPUT_BYTES - outputBytes;
+      if (remaining > 0) {
+        const kept = chunk.subarray(0, remaining);
+        target.push(kept);
+        outputBytes += kept.byteLength;
+      }
+      if (chunk.byteLength > remaining) {
+        void stop(`hook output exceeded ${MAX_HOOK_OUTPUT_BYTES} bytes`);
+      }
+    };
+
+    const timer = setTimeout(() => {
+      void stop(`hook timed out after ${timeoutMs}ms`);
     }, timeoutMs);
 
-    child.stdout?.on('data', (d: Buffer) => { stdout += d.toString(); });
-    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+    child.stdout?.on('data', (chunk: Buffer) => capture(stdout, chunk));
+    child.stderr?.on('data', (chunk: Buffer) => capture(stderr, chunk));
     child.stdin?.on('error', () => { /* ignore EPIPE if the hook exits before reading */ });
-    child.on('error', (err) => finish({ errored: true, feedback: err.message }));
+    child.on('error', (err) => {
+      if (!stopping) finish({ errored: true, feedback: err.message });
+    });
     child.on('close', (code) => {
-      if (timedOut) return finish({ errored: true, feedback: `hook timed out after ${timeoutMs}ms` });
+      if (stopping) return;
       let decision: 'allow' | 'deny' | undefined;
       let feedback: string | undefined;
-      const parsed = tryParseJson(stdout);
+      const parsed = tryParseJson(Buffer.concat(stdout).toString('utf8'));
       if (parsed && typeof parsed === 'object') {
         const d = (parsed as { decision?: unknown }).decision;
         if (d === 'allow' || d === 'deny') decision = d;
@@ -94,7 +121,8 @@ function runHookCommand(hook: HookDefinition, payload: string): Promise<HookRunO
         if (typeof f === 'string') feedback = f;
       }
       if (!decision) decision = code === 0 ? 'allow' : 'deny';
-      finish({ decision, feedback: feedback ?? (stderr.trim() || undefined), errored: false });
+      const errorText = Buffer.concat(stderr).toString('utf8').trim();
+      finish({ decision, feedback: feedback ?? (errorText || undefined), errored: false });
     });
 
     try {
@@ -106,23 +134,58 @@ function runHookCommand(hook: HookDefinition, payload: string): Promise<HookRunO
   });
 }
 
-/** Best-effort terminate a shell child and its descendants. `shell: true` means
- *  a plain kill() only reaps the shell, not the command it spawned, so on Windows
- *  we use `taskkill /T` to take down the whole tree. */
-function killTree(child: ReturnType<typeof spawn>): void {
-  if (!child.pid) {
-    try { child.kill(); } catch { /* already gone */ }
-    return;
-  }
-  if (process.platform === 'win32') {
+/** Terminate the process group on POSIX or await taskkill /T on Windows. */
+function killTree(child: ChildProcess): Promise<void> {
+  const pid = child.pid;
+  if (!pid) return Promise.reject(new Error('hook process PID is unavailable'));
+  if (process.platform !== 'win32') {
     try {
-      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' });
-    } catch {
-      try { child.kill(); } catch { /* already gone */ }
+      process.kill(-pid, 'SIGKILL');
+      return Promise.resolve();
+    } catch (error) {
+      try { child.kill('SIGKILL'); } catch { /* best-effort direct fallback */ }
+      return Promise.reject(new Error(`failed to terminate hook process group ${pid}`, { cause: error }));
     }
-  } else {
-    try { child.kill('SIGKILL'); } catch { /* already gone */ }
   }
+
+  return new Promise((resolve, reject) => {
+    let killer: ChildProcess;
+    try {
+      killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true
+      });
+    } catch (error) {
+      try { child.kill('SIGKILL'); } catch { /* best-effort direct fallback */ }
+      reject(new Error(`failed to start taskkill for hook process tree ${pid}`, { cause: error }));
+      return;
+    }
+
+    let done = false;
+    const finish = (error?: Error): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      try { killer.kill('SIGKILL'); } catch { /* already gone */ }
+      try { child.kill('SIGKILL'); } catch { /* best-effort direct fallback */ }
+      finish(new Error(`taskkill did not settle within ${TREE_KILL_TIMEOUT_MS}ms for hook process tree ${pid}`));
+    }, TREE_KILL_TIMEOUT_MS);
+    killer.once('error', (error) => {
+      try { child.kill('SIGKILL'); } catch { /* best-effort direct fallback */ }
+      finish(new Error(`taskkill failed for hook process tree ${pid}: ${error.message}`, { cause: error }));
+    });
+    killer.once('close', (code, signal) => {
+      if (code === 0) finish();
+      else {
+        try { child.kill('SIGKILL'); } catch { /* best-effort direct fallback */ }
+        finish(new Error(`taskkill failed for hook process tree ${pid} (exit ${code ?? 'unknown'}${signal ? `, signal ${signal}` : ''})`));
+      }
+    });
+  });
 }
 
 function tryParseJson(text: string): unknown {

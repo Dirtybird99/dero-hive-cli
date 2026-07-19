@@ -21,16 +21,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "@noble/curves": "^2.2.0",
-    "zod": "^3.25.0"
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@noble/curves": "2.2.0",
+    "zod": "3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^22.15.0",
-    "typescript": "^5.8.0"
-  },
-  "allowScripts": {
-    "esbuild@0.28.1": true
+    "@types/node": "22.20.1",
+    "typescript": "5.9.3"
   },
   "keywords": [
     "dero",
@@ -53,6 +50,15 @@
   "vendoredFrom": {
     "url": "https://github.com/DHEBP/dero-mcp-server",
     "version": "0.4.8",
-    "note": "Vendored as a hardcoded dependency of DERO Hive CLI. To update, refresh this directory from upstream and rerun npm run build:mcp."
+    "commit": "5c21560241dc2a5405e0315243ef9b84182bcbb9",
+    "docsCommit": "5ebe96fd7b231feaca87a86ba3473e437b08d9f2",
+    "localPatches": [
+      "src/proof-decode.ts: stricter CBOR, integer, hash, address, and compressed-point validation",
+      "src/composites/tela-inspect.ts: local uintVariables identifier rename"
+    ],
+    "wrapperChanges": [
+      "package.json and package-lock.json: private bundled wrapper, Node 22 baseline, and exact dependency pins"
+    ],
+    "note": "Vendored as a bundled dependency of DERO Hive CLI with the documented local patches. To update, refresh from the pinned upstream commits, preserve or rebase the patches, and rerun npm run build:mcp."
   }
 }

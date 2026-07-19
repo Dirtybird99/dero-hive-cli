@@ -1,5 +1,4 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { EventEmitter } from 'node:events';
 import type { McpServerConfig, McpServerStatus, ToolDefinition } from '@shared/types';
@@ -13,6 +12,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { McpServerInstance } from './client';
+import { BoundedStdioClientTransport, createBoundedMcpFetch } from './transport';
 
 const RECONNECT_DELAY_MS = 2000;
 const RECONNECT_MAX_DELAY_MS = 60_000;
@@ -20,6 +20,13 @@ const RECONNECT_MAX_ATTEMPTS = 8;
 
 export function validateMcpConfig(cfg: McpServerConfig): void {
   if (!cfg.id?.trim() || !cfg.name?.trim()) throw new Error('MCP server id and name are required');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(cfg.id)) {
+    throw new Error('MCP server id must use only letters, numbers, dot, underscore, or hyphen');
+  }
+  if (cfg.timeoutMs !== undefined
+    && (!Number.isInteger(cfg.timeoutMs) || cfg.timeoutMs < 100 || cfg.timeoutMs > 300_000)) {
+    throw new Error('MCP server timeout must be an integer between 100 and 300000ms');
+  }
   if (cfg.transport !== undefined && !['stdio', 'http'].includes(cfg.transport)) {
     throw new Error('Unsupported MCP transport');
   }
@@ -73,6 +80,7 @@ export class McpManager extends EventEmitter {
   private pendingReconnects = new Map<string, NodeJS.Timeout>();
   private reconnectAttempts = new Map<string, number>();
   private lastErrors = new Map<string, string>();
+  private shuttingDown = false;
 
   async ensureBundledServers(onlyName?: string): Promise<void> {
     const mcpDir = join(resourcesRoot, 'mcp');
@@ -293,6 +301,7 @@ export class McpManager extends EventEmitter {
 
   async connect(cfg: McpServerConfig): Promise<void> {
     validateMcpConfig(cfg);
+    if (this.shuttingDown) throw new Error('MCP manager is shutting down');
     if (this.servers.has(cfg.id)) {
       logger.debug('mcp', `${cfg.name} already connected`);
       return;
@@ -308,9 +317,10 @@ export class McpManager extends EventEmitter {
       ? new StreamableHTTPClientTransport(new URL(cfg.url || ''), {
           requestInit: bearerToken
             ? { headers: { Authorization: `Bearer ${bearerToken}` } }
-            : undefined
+            : undefined,
+          fetch: createBoundedMcpFetch()
         })
-      : new StdioClientTransport({
+      : new BoundedStdioClientTransport({
           // The SDK delegates to cross-spawn, which resolves Windows .cmd
           // shims and invokes ComSpec /d /s /c with escaped arguments.
           command: cfg.command || '',
@@ -330,13 +340,16 @@ export class McpManager extends EventEmitter {
       transport,
       status: 'connecting',
       trust: cfg.trust,
+      timeoutMs: cfg.timeoutMs,
       tools: [], resources: [], prompts: []
     };
     this.servers.set(cfg.id, instance);
 
     const timeoutMs = cfg.timeoutMs ?? 30_000;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error(`Connection timeout after ${timeoutMs}ms`)), timeoutMs);
+      timeoutHandle = setTimeout(() => reject(new Error(`Connection timeout after ${timeoutMs}ms`)), timeoutMs);
+      timeoutHandle.unref?.();
     });
 
     try {
@@ -345,9 +358,9 @@ export class McpManager extends EventEmitter {
 
       // Discover tools, resources, prompts
       const [toolsRes, resourcesRes, promptsRes] = await Promise.allSettled([
-        client.listTools(),
-        client.listResources(),
-        client.listPrompts()
+        client.listTools(undefined, { timeout: timeoutMs, maxTotalTimeout: timeoutMs }),
+        client.listResources(undefined, { timeout: timeoutMs, maxTotalTimeout: timeoutMs }),
+        client.listPrompts(undefined, { timeout: timeoutMs, maxTotalTimeout: timeoutMs })
       ]);
 
       if (toolsRes.status === 'fulfilled') {
@@ -379,8 +392,8 @@ export class McpManager extends EventEmitter {
       this.lastErrors.delete(cfg.id);
 
       // Auto-reconnect on disconnect
-      transport.onclose = () => this.handleDisconnect(cfg.id, cfg);
-      transport.onerror = (err) => logger.warn('mcp', `${cfg.name} transport error: ${err instanceof Error ? err.message : String(err)}`);
+      client.onclose = () => this.handleDisconnect(cfg.id, cfg);
+      client.onerror = (err) => logger.warn('mcp', `${cfg.name} transport error: ${err instanceof Error ? err.message : String(err)}`);
 
       logger.info('mcp', `connected ${cfg.name} (${instance.tools.length} tools, ${instance.resources.length} resources, ${instance.prompts.length} prompts)`);
       this.emitChange();
@@ -392,6 +405,8 @@ export class McpManager extends EventEmitter {
       this.servers.delete(cfg.id);
       this.emitChange();
       throw err;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     }
   }
 
@@ -404,13 +419,17 @@ export class McpManager extends EventEmitter {
     if (!inst) return;
     // Intentional disconnect — detach the auto-reconnect handler so closing
     // the transport doesn't schedule a reconnect that resurrects the server.
-    inst.transport.onclose = undefined;
+    inst.client.onclose = undefined;
     try { await inst.transport.close(); } catch { /* ignore */ }
     this.servers.delete(id);
     this.emitChange();
   }
 
   async shutdownAll(): Promise<void> {
+    this.shuttingDown = true;
+    for (const timer of this.pendingReconnects.values()) clearTimeout(timer);
+    this.pendingReconnects.clear();
+    this.reconnectAttempts.clear();
     const all = Array.from(this.servers.keys());
     await Promise.allSettled(all.map((id) => this.disconnect(id)));
   }
@@ -420,9 +439,14 @@ export class McpManager extends EventEmitter {
   }
 
   getAllTools(): ToolDefinition[] {
-    const out: ToolDefinition[] = [];
-    for (const inst of this.servers.values()) out.push(...inst.tools);
-    return out;
+    const entries = [...this.servers.values()].flatMap((server) =>
+      server.tools.map((tool) => ({ server, tool }))
+    );
+    const counts = new Map<string, number>();
+    for (const { tool } of entries) counts.set(tool.name, (counts.get(tool.name) || 0) + 1);
+    return entries.map(({ server, tool }) => counts.get(tool.name) === 1
+      ? tool
+      : { ...tool, name: `mcp:${server.id}:${tool.name}` });
   }
 
   /**
@@ -433,17 +457,21 @@ export class McpManager extends EventEmitter {
    */
   resolveTool(name: string): { serverId: string; serverName: string; toolName: string; trusted: boolean } | null {
     if (name.startsWith('mcp:')) {
-      const [, serverId, ...rest] = name.split(':');
-      const inst = this.servers.get(serverId);
-      if (!inst) return null;
-      return { serverId, serverName: this.configName(serverId), toolName: rest.join(':'), trusted: !!inst.trust };
+      const qualified = name.slice('mcp:'.length);
+      const matches = [...this.servers.values()].flatMap((inst) => {
+        const prefix = `${inst.id}:`;
+        if (!qualified.startsWith(prefix)) return [];
+        const toolName = qualified.slice(prefix.length);
+        return inst.tools.some((tool) => tool.name === toolName) ? [{ inst, toolName }] : [];
+      });
+      if (matches.length !== 1) return null;
+      const [{ inst, toolName }] = matches;
+      return { serverId: inst.id, serverName: this.configName(inst.id), toolName, trusted: !!inst.trust };
     }
-    for (const inst of this.servers.values()) {
-      if (inst.tools.some((t) => t.name === name)) {
-        return { serverId: inst.id, serverName: this.configName(inst.id), toolName: name, trusted: !!inst.trust };
-      }
-    }
-    return null;
+    const matches = [...this.servers.values()].filter((inst) => inst.tools.some((tool) => tool.name === name));
+    if (matches.length !== 1) return null;
+    const [inst] = matches;
+    return { serverId: inst.id, serverName: this.configName(inst.id), toolName: name, trusted: !!inst.trust };
   }
 
   private configName(id: string): string {
@@ -451,10 +479,20 @@ export class McpManager extends EventEmitter {
     return row?.name || id;
   }
 
-  async callTool(serverId: string, toolName: string, args: Record<string, unknown>): Promise<{ content: unknown; isError?: boolean }> {
+  async callTool(
+    serverId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<{ content: unknown; isError?: boolean }> {
     const inst = this.servers.get(serverId);
     if (!inst) throw new Error(`MCP server ${serverId} not connected`);
-    const result = await inst.client.callTool({ name: toolName, arguments: args });
+    const timeoutMs = inst.timeoutMs ?? 60_000;
+    const result = await inst.client.callTool(
+      { name: toolName, arguments: args },
+      undefined,
+      { signal, timeout: timeoutMs, maxTotalTimeout: timeoutMs }
+    );
     return { content: result.content, isError: result.isError as boolean | undefined };
   }
 
@@ -482,6 +520,7 @@ export class McpManager extends EventEmitter {
     const attempt = (this.reconnectAttempts.get(id) ?? 0) + 1;
     this.servers.delete(id);
     if (cause) this.lastErrors.set(id, cause instanceof Error ? cause.message : String(cause));
+    if (this.shuttingDown) return;
 
     if (attempt > RECONNECT_MAX_ATTEMPTS) {
       this.reconnectAttempts.delete(id);
@@ -498,11 +537,13 @@ export class McpManager extends EventEmitter {
 
     const t = setTimeout(() => {
       this.pendingReconnects.delete(id);
+      if (this.shuttingDown) return;
       this.connect(cfg).catch((err) => {
         logger.error('mcp', `reconnect ${cfg.name} failed`, err);
         this.handleDisconnect(id, cfg, err);
       });
     }, delay);
+    t.unref?.();
     this.pendingReconnects.set(id, t);
     this.emitChange();
   }

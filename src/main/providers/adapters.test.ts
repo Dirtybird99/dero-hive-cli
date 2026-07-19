@@ -9,6 +9,15 @@ import { AnthropicAdapter } from './anthropic.js';
 import type { ProviderStreamEvent, ProviderStreamRequest } from './base.js';
 import { OpenAICompatibleAdapter } from './openai-compatible.js';
 import { getProviderApiKey } from './registry.js';
+import { parseSSE } from './streaming.js';
+import {
+  MAX_PROVIDER_ERROR_BYTES,
+  MAX_PROVIDER_JSON_BYTES,
+  MAX_PROVIDER_SSE_EVENT_BYTES,
+  MAX_PROVIDER_STREAM_BYTES,
+  providerRequestSignal,
+  readProviderText
+} from './http.js';
 
 // Keep logger output (silent-stream warnings etc.) inside a disposable directory.
 const dataDir = mkdtempSync(join(tmpdir(), 'dero-hive-adapters-'));
@@ -114,6 +123,13 @@ const server = createServer((req, res) => {
       res.setHeader('content-type', 'text/event-stream');
       res.end(payload);
     };
+    const holdDeclaredBody = (contentType: string, bytes: number, status = 200): void => {
+      res.statusCode = status;
+      res.setHeader('content-type', contentType);
+      res.setHeader('content-length', String(bytes));
+      res.flushHeaders();
+      hangingResponses.push(res);
+    };
     res.setHeader('content-type', 'application/json');
     if (req.url === '/anthropic/models') res.end(JSON.stringify({ data: [{ id: 'claude-test' }] }));
     else if (req.url === '/leak/chat/completions') {
@@ -134,8 +150,20 @@ const server = createServer((req, res) => {
       res.statusCode = 400;
       res.end(JSON.stringify({ error: { message: 'Invalid api key stream-secret provided' } }));
     }
+    else if (req.url === '/sse-error-oversized/chat/completions') {
+      holdDeclaredBody('application/json', MAX_PROVIDER_ERROR_BYTES + 1, 500);
+    }
+    else if (req.url === '/sse-event-oversized/chat/completions') {
+      sse(sseData({ choices: [{ delta: { content: 'x'.repeat(MAX_PROVIDER_SSE_EVENT_BYTES) } }] }));
+    }
+    else if (req.url === '/sse-body-oversized/chat/completions') {
+      holdDeclaredBody('text/event-stream', MAX_PROVIDER_STREAM_BYTES + 1);
+    }
     else if (req.url === '/json-fallback/chat/completions') res.end(JSON.stringify(openAiJsonFallbackBody));
     else if (req.url === '/json-bad/chat/completions') res.end('this is not json');
+    else if (req.url === '/json-body-oversized/chat/completions') {
+      holdDeclaredBody('application/json', MAX_PROVIDER_JSON_BYTES + 1);
+    }
     else if (req.url === '/anthropic-happy/messages') sse(anthropicHappySse);
     else if (req.url === '/anthropic-error/messages') sse(anthropicMidStreamErrorSse);
     else if (req.url === '/anthropic-fail/messages') {
@@ -145,6 +173,9 @@ const server = createServer((req, res) => {
     else if (req.url === '/anthropic-fail/models') {
       res.statusCode = 500;
       res.end('{}');
+    }
+    else if (req.url === '/anthropic-model-oversized/models') {
+      holdDeclaredBody('application/json', MAX_PROVIDER_JSON_BYTES + 1);
     }
     else res.end(JSON.stringify({ choices: [{ message: { content: 'pong' } }] }));
   });
@@ -203,6 +234,64 @@ try {
     new OpenAICompatibleAdapter(config(path.slice(1), `${base}${path}`, presetId), 'stream-secret');
   const anthropicAdapter = (path: string): AnthropicAdapter =>
     new AnthropicAdapter(config(path.slice(1), `${base}${path}`, 'anthropic'), 'anthro-stream-secret');
+
+  // The shared body reader must time out even after headers arrive and the
+  // body stalls forever. Adapter requests use the same signal composition.
+  const stalledBody = new Response(new ReadableStream<Uint8Array>({ start() { /* intentionally never close */ } }));
+  const stalledAt = Date.now();
+  await assert.rejects(
+    readProviderText(stalledBody, MAX_PROVIDER_JSON_BYTES, providerRequestSignal(undefined, 25)),
+    /abort|timeout/iu
+  );
+  assert.ok(Date.now() - stalledAt < 1_000, 'stalled body timeout must be prompt');
+  const chunkedOversize = new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Buffer.alloc(8));
+      controller.enqueue(Buffer.alloc(1));
+      controller.close();
+    }
+  }));
+  await assert.rejects(
+    readProviderText(chunkedOversize, 8, providerRequestSignal(undefined, 1_000)),
+    /Provider response exceeds 8 byte limit/u
+  );
+  let hostileCancelCalled = false;
+  const hostileCancel = new Response(new ReadableStream<Uint8Array>({
+    pull: () => new Promise<void>(() => { /* stalled read */ }),
+    cancel: () => {
+      hostileCancelCalled = true;
+      return new Promise<void>(() => { /* cancel also stalls forever */ });
+    }
+  }));
+  const consumeHostileSse = async (): Promise<void> => {
+    await parseSSE(hostileCancel, providerRequestSignal(undefined, 25)).next();
+  };
+  const hostileCancelAt = Date.now();
+  await assert.rejects(consumeHostileSse(), /abort|timeout/iu);
+  assert.equal(hostileCancelCalled, true);
+  assert.ok(Date.now() - hostileCancelAt < 1_000, 'a non-settling cancel must not defeat the deadline');
+  const tinyChunkPayload = 'x'.repeat(512 * 1024);
+  const tinyChunkWire = Buffer.from(sseData({ choices: [{ delta: { content: tinyChunkPayload } }] }));
+  let tinyChunkOffset = 0;
+  const tinyChunkResponse = new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (tinyChunkOffset >= tinyChunkWire.length) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(tinyChunkWire.length, tinyChunkOffset + 8);
+      controller.enqueue(tinyChunkWire.subarray(tinyChunkOffset, end));
+      tinyChunkOffset = end;
+    }
+  }));
+  const tinyChunkEvents = [];
+  for await (const event of parseSSE(tinyChunkResponse, providerRequestSignal(undefined, 5_000))) {
+    tinyChunkEvents.push(event);
+  }
+  assert.equal(tinyChunkEvents.length, 1);
+  const tinyChunkData = tinyChunkEvents[0]?.data as { choices?: Array<{ delta?: { content?: string } }> };
+  assert.equal(tinyChunkData.choices?.[0]?.delta?.content?.length, tinyChunkPayload.length,
+    'newline-free tiny chunks must be framed without quadratic accumulation');
 
   // 1. OpenAI happy path: text deltas (content/text fields), reasoning deltas
   //    (reasoning_content/reasoning fields), tool-call argument assembly across
@@ -337,6 +426,12 @@ try {
   assert.match(httpError[0]?.error || '', /\[REDACTED\]/u);
   assert.doesNotMatch(httpError[0]?.error || '', /stream-secret/u);
 
+  // Oversized error bodies are rejected from headers without waiting for the
+  // hostile server to finish sending them.
+  const oversizedHttpError = await collect(openAiAdapter('/sse-error-oversized').stream(streamReq()));
+  assert.equal(oversizedHttpError.length, 1);
+  assert.match(oversizedHttpError[0]?.error || '', /Provider response exceeds 65536 byte limit/u);
+
   // 7. Provider ignores stream:true and returns a single JSON object: content,
   //    reasoning, tool calls (missing fields defaulting to '') and usage are
   //    still delivered.
@@ -359,8 +454,24 @@ try {
   const jsonBad = await collect(openAiAdapter('/json-bad').stream(streamReq()));
   assert.deepEqual(jsonBad, [{ type: 'done' }]);
 
+  // JSON fallbacks, whole SSE bodies, and individual SSE events each have an
+  // independent ceiling. Declared oversized bodies stay open to catch code
+  // that checks only after buffering the response.
+  await assert.rejects(
+    collect(openAiAdapter('/json-body-oversized').stream(streamReq())),
+    new RegExp(`Provider response exceeds ${MAX_PROVIDER_JSON_BYTES} byte limit`, 'u')
+  );
+  await assert.rejects(
+    collect(openAiAdapter('/sse-body-oversized').stream(streamReq())),
+    new RegExp(`Provider stream exceeds ${MAX_PROVIDER_STREAM_BYTES} byte limit`, 'u')
+  );
+  await assert.rejects(
+    collect(openAiAdapter('/sse-event-oversized').stream(streamReq())),
+    new RegExp(`Provider SSE event exceeds ${MAX_PROVIDER_SSE_EVENT_BYTES} byte limit`, 'u')
+  );
+
   // 9. Cancellation mid-stream: the generator rejects once the signal aborts.
-  //    parseSSE's abort handler swallows the rejection of its fire-and-forget
+  //    parseSSE cleanup handles the rejection of its fire-and-forget
   //    `reader.cancel()` on a stream the fetch layer has already errored, so
   //    the abort must leak NO unhandled rejections of any shape.
   const unhandledRejections: unknown[] = [];
@@ -477,6 +588,10 @@ try {
   // 14. Anthropic testConnection surfaces non-2xx statuses.
   const anthroDown = await anthropicAdapter('/anthropic-fail').testConnection();
   assert.deepEqual(anthroDown, { ok: false, error: 'HTTP 500 Internal Server Error' });
+
+  const anthroOversized = await anthropicAdapter('/anthropic-model-oversized').testConnection();
+  assert.equal(anthroOversized.ok, false);
+  assert.match(anthroOversized.error || '', new RegExp(`Provider response exceeds ${MAX_PROVIDER_JSON_BYTES} byte limit`, 'u'));
 
   console.log('provider adapter tests passed');
 } finally {

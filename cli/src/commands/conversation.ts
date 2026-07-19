@@ -3,6 +3,21 @@ import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 import * as conversationService from '../services/conversation.js';
 import * as format from '../utils/format.js';
+import { closeConversationSessions } from '../../../src/main/providers/registry.js';
+import { sanitizeTerminalText } from '../../../src/shared/terminal.js';
+
+export function formatConversationMessageContent(content: unknown): string {
+  return sanitizeTerminalText(typeof content === 'string' ? content : JSON.stringify(content, null, 2));
+}
+
+export function formatConversationSearchResult(result: {
+  conversationId: string;
+  messageId: string;
+  role: string;
+  snippet: string;
+}): string {
+  return sanitizeTerminalText(`${result.conversationId} / ${result.messageId} (${result.role}): ${result.snippet}`);
+}
 
 export function conversationCommand(): Command {
   const cmd = new Command('conversation')
@@ -38,7 +53,7 @@ export function conversationCommand(): Command {
       for (const m of messages) {
         const prefix = m.role === 'user' ? chalk.blue('You') : m.role === 'assistant' ? chalk.green('AI') : chalk.gray('Tool');
         console.log(`\n${prefix}:`);
-        const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2);
+        const content = formatConversationMessageContent(m.content);
         console.log(content);
       }
     });
@@ -52,9 +67,10 @@ export function conversationCommand(): Command {
         format.printError(`Conversation ${id} not found`);
         return;
       }
-      const ok = await confirm({ message: `Delete "${conv.title}"?`, default: false });
+      const ok = await confirm({ message: `Delete "${sanitizeTerminalText(conv.title)}"?`, default: false });
       if (ok) {
-        conversationService.deleteConversation(id);
+        await closeConversationSessions(id);
+        await conversationService.deleteConversation(id);
         format.printSuccess(`Conversation ${id} deleted`);
       }
     });
@@ -81,7 +97,7 @@ export function conversationCommand(): Command {
         return;
       }
       for (const r of results) {
-        console.log(`${r.conversationId} / ${r.messageId} (${r.role}): ${r.snippet}`);
+        console.log(formatConversationSearchResult(r));
       }
     });
 

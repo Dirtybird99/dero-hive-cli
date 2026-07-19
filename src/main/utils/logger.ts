@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { appendFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, existsSync } from 'node:fs';
 import { paths } from './paths';
 import { ensureDirs } from './paths';
 
@@ -13,7 +13,7 @@ function ensureLogDir(): void {
       // Use the full ensureDirs helper; falls back to mkdirSync on failure
       try { ensureDirs(); }
       catch {
-        if (!existsSync(paths.logs)) mkdirSync(paths.logs, { recursive: true });
+        if (!existsSync(paths.logs)) mkdirSync(paths.logs, { recursive: true, mode: 0o700 });
       }
     }
     initialized = true;
@@ -23,7 +23,12 @@ function ensureLogDir(): void {
 }
 
 function safeAppend(line: string): void {
-  try { ensureLogDir(); appendFileSync(join(paths.logs, 'hive.log'), line + '\n'); }
+  try {
+    ensureLogDir();
+    const logPath = join(paths.logs, 'hive.log');
+    appendFileSync(logPath, line + '\n', { mode: 0o600 });
+    if (process.platform !== 'win32') chmodSync(logPath, 0o600);
+  }
   catch { /* swallow */ }
 }
 

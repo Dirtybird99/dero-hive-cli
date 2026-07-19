@@ -1,4 +1,10 @@
 import { logger } from '../utils/logger';
+import {
+  MAX_PROVIDER_JSON_BYTES,
+  PROVIDER_CONTROL_TIMEOUT_MS,
+  providerRequestSignal,
+  readProviderJson
+} from './http';
 
 // Per-model metadata some providers expose alongside the id (OpenRouter is the
 // richest; Ollama reports capabilities). Live values beat our hardcoded table.
@@ -37,6 +43,7 @@ export async function fetchLiveModels(
   customHeaders?: Record<string, string>
 ): Promise<LiveModelsResult> {
   const base = baseUrl.replace(/\/$/, '');
+  const signal = providerRequestSignal(undefined, PROVIDER_CONTROL_TIMEOUT_MS);
   const headers: Record<string, string> = {
     ...customHeaders
   };
@@ -56,12 +63,12 @@ export async function fetchLiveModels(
     try {
       const tagsUrl = new URL('/api/tags', base).toString();
       logger.debug('models', `fetching ${tagsUrl}`);
-      const r = await fetch(tagsUrl, { headers });
+      const r = await fetch(tagsUrl, { headers, signal });
       if (r.ok) {
-        const data = await r.json();
+        const data = await readProviderJson<unknown>(r, MAX_PROVIDER_JSON_BYTES, signal);
         const result = toResult(extractModels(data), tagsUrl);
         if (result) return result;
-      }
+      } else void r.body?.cancel().catch(() => undefined);
     } catch { /* fall through to /models */ }
   }
 
@@ -69,12 +76,13 @@ export async function fetchLiveModels(
   try {
     const url = `${base}/models`;
     logger.debug('models', `fetching ${url}`);
-    const r = await fetch(url, { headers });
+    const r = await fetch(url, { headers, signal });
     if (r.ok) {
-      const data = await r.json();
+      const data = await readProviderJson<unknown>(r, MAX_PROVIDER_JSON_BYTES, signal);
       const result = toResult(extractModels(data), url);
       if (result) return result;
     } else {
+      void r.body?.cancel().catch(() => undefined);
       logger.debug('models', `${url} returned ${r.status}`);
     }
   } catch (err) {
@@ -84,12 +92,12 @@ export async function fetchLiveModels(
   // 2. Fallback: Anthropic's models endpoint uses ?limit parameter
   if (presetId === 'anthropic' || /anthropic\.com/.test(base)) {
     try {
-      const r = await fetch(`${base}/models?limit=100`, { headers });
+      const r = await fetch(`${base}/models?limit=100`, { headers, signal });
       if (r.ok) {
-        const data = await r.json();
+        const data = await readProviderJson<unknown>(r, MAX_PROVIDER_JSON_BYTES, signal);
         const result = toResult(extractModels(data), 'anthropic ?limit');
         if (result) return result;
-      }
+      } else void r.body?.cancel().catch(() => undefined);
     } catch { /* ignore */ }
   }
 

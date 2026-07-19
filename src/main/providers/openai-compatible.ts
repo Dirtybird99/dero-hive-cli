@@ -4,6 +4,15 @@ import type { ProviderConfig, Message, ToolDefinition, ContentPart } from '@shar
 import { supportsOpenAIReasoningEffort } from '@shared/thinkingCapabilities';
 import { APP_VERSION } from '@shared/version';
 import { logger, redactSensitive } from '../utils/logger';
+import {
+  MAX_PROVIDER_ERROR_BYTES,
+  MAX_PROVIDER_JSON_BYTES,
+  PROVIDER_CONTROL_TIMEOUT_MS,
+  PROVIDER_STREAM_TIMEOUT_MS,
+  providerRequestSignal,
+  readProviderJson,
+  readProviderText
+} from './http';
 
 // Kimi Code's docs explicitly require tools to identify themselves via the
 // User-Agent header: "Please maintain the tool's real identity identifier
@@ -41,6 +50,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
   async testConnection(): Promise<{ ok: boolean; error?: string; models?: string[]; hint?: string }> {
     const baseUrl = this.cfg.baseUrl.replace(/\/$/, '');
+    const signal = providerRequestSignal(undefined, PROVIDER_CONTROL_TIMEOUT_MS);
 
     // 1. Try a tiny chat completion first — this is the real auth test.
     //    /models is often public and doesn't prove the key can actually chat.
@@ -54,10 +64,14 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           messages: [{ role: 'user', content: 'ping' }],
           max_tokens: 1,
           stream: false
-        })
+        }),
+        signal
       });
-      if (r.ok) return { ok: true, models: this.cfg.models.map((m) => m.id) };
-      const body = await r.text();
+      if (r.ok) {
+        void r.body?.cancel().catch(() => undefined);
+        return { ok: true, models: this.cfg.models.map((m) => m.id) };
+      }
+      const body = await readProviderText(r, MAX_PROVIDER_ERROR_BYTES, signal);
       if (r.status === 401 || r.status === 403) {
         // Some gateways (OpenCode Zen/Go) return 401 for other problems too
         // (e.g. "model not supported") — surface the provider's own message.
@@ -97,25 +111,26 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
     // 2. Fallback: GET /models (useful for local/ollama or public gateways)
     try {
-      const r = await fetch(`${baseUrl}/models`, { headers: this.headers() });
+      const r = await fetch(`${baseUrl}/models`, { headers: this.headers(), signal });
       if (r.ok) {
-        const data = (await r.json()) as { data?: { id: string }[] };
+        const data = await readProviderJson<{ data?: { id: string }[] }>(r, MAX_PROVIDER_JSON_BYTES, signal);
         return { ok: true, models: (data.data || []).map((m) => m.id) };
       }
       // 401/403 with /models usually means the key is wrong; report that early.
       if (r.status === 401 || r.status === 403) {
-        const rawDetail = extractErrorMessage(await r.text());
+        const rawDetail = extractErrorMessage(await readProviderText(r, MAX_PROVIDER_ERROR_BYTES, signal));
         const detail = rawDetail ? this.safeError(rawDetail) : null;
         return { ok: false, error: `Auth failed (${r.status})${detail ? `: ${detail}` : ': check your API key.'}`, hint: 'Edit the provider and re-enter the key.' };
       }
       // 404: try common URL variants
       if (r.status === 404) {
+        void r.body?.cancel().catch(() => undefined);
         const host = this.extractHost();
         const probes = await Promise.allSettled([
-          this.probeUrl(`https://${host}/v1/models`),
-          this.probeUrl(`https://${host}/api/v1/models`),
-          this.probeUrl(`https://api.${host}/v1/models`),
-          this.probeUrl(`https://${host}/openai/v1/models`)
+          this.probeUrl(`https://${host}/v1/models`, signal),
+          this.probeUrl(`https://${host}/api/v1/models`, signal),
+          this.probeUrl(`https://api.${host}/v1/models`, signal),
+          this.probeUrl(`https://${host}/openai/v1/models`, signal)
         ]);
         const found = probes.find((p) => p.status === 'fulfilled');
         if (found && found.value) {
@@ -131,6 +146,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           hint: 'The base URL is wrong. Check the provider\'s dashboard for the exact API endpoint. Common shapes: https://api.example.com/v1, https://example.com/openai/v1.'
         };
       }
+      void r.body?.cancel().catch(() => undefined);
       return { ok: false, error: `${r.status} ${r.statusText}` };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -153,13 +169,15 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     }
   }
 
-  private async probeUrl(url: string): Promise<string | null> {
+  private async probeUrl(url: string, signal: AbortSignal): Promise<string | null> {
     try {
-      const r = await fetch(url, { headers: this.headers(), method: 'GET' });
+      const r = await fetch(url, { headers: this.headers(), method: 'GET', signal });
       if (r.ok || r.status === 401) {
+        void r.body?.cancel().catch(() => undefined);
         // 200 or auth-required means this URL is the right shape
         return url.replace(/\/models$/, '');
       }
+      void r.body?.cancel().catch(() => undefined);
     } catch { /* ignore */ }
     return null;
   }
@@ -294,15 +312,22 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
     logger.debug('openai', `POST ${url} model=${req.model}`);
 
+    const signal = providerRequestSignal(req.signal, PROVIDER_STREAM_TIMEOUT_MS);
+
     const response = await fetch(url, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(body),
-      signal: req.signal
+      signal
     });
 
     if (!response.ok) {
-      const errText = await response.text();
+      let errText: string;
+      try { errText = await readProviderText(response, MAX_PROVIDER_ERROR_BYTES, signal); }
+      catch (error) {
+        if (signal.aborted) throw error;
+        errText = error instanceof Error ? error.message : String(error);
+      }
       const safeError = this.safeError(errText.slice(0, 500));
       logger.debug('openai', `response error ${response.status}: ${safeError}`);
       yield { type: 'error', error: `${response.status} ${response.statusText}: ${safeError}` };
@@ -314,8 +339,9 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     // Some providers ignore `stream: true` and return a single JSON object.
     // Handle that gracefully instead of producing an empty stream.
     if (contentType.includes('application/json')) {
+      const responseText = await readProviderText(response, MAX_PROVIDER_JSON_BYTES, signal);
       try {
-        const json = (await response.json()) as Record<string, unknown>;
+        const json = JSON.parse(responseText) as Record<string, unknown>;
         const choice = (json.choices as Record<string, unknown>[] | undefined)?.[0];
         const message = choice?.message as Record<string, unknown> | undefined;
         const content = typeof message?.content === 'string' ? message.content : undefined;
@@ -362,7 +388,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     // with a blank assistant bubble.
     let committed = false;
 
-    for await (const evt of parseSSE(response, req.signal)) {
+    for await (const evt of parseSSE(response, signal)) {
       if (evt.raw === '[DONE]') break;
       const data = evt.data as Record<string, unknown> | undefined;
       if (!data) continue;

@@ -3,6 +3,15 @@ import { parseSSE } from './streaming';
 import type { ProviderConfig, ContentPart } from '@shared/types';
 import { logger, redactSensitive } from '../utils/logger';
 import { anthropicThinkingBudget, supportsAnthropicExtendedThinking } from '@shared/thinkingCapabilities';
+import {
+  MAX_PROVIDER_ERROR_BYTES,
+  MAX_PROVIDER_JSON_BYTES,
+  PROVIDER_CONTROL_TIMEOUT_MS,
+  PROVIDER_STREAM_TIMEOUT_MS,
+  providerRequestSignal,
+  readProviderJson,
+  readProviderText
+} from './http';
 
 // Anthropic Messages API adapter. Translates OpenAI-style internal types to Anthropic format.
 // Supports: system prompt, multi-modal (images), tools, prompt caching, extended thinking.
@@ -18,12 +27,17 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   async testConnection(): Promise<{ ok: boolean; error?: string; models?: string[] }> {
+    const signal = providerRequestSignal(undefined, PROVIDER_CONTROL_TIMEOUT_MS);
     try {
       const r = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/models`, {
-        headers: this.headers()
+        headers: this.headers(),
+        signal
       });
-      if (!r.ok) return { ok: false, error: `HTTP ${r.status} ${r.statusText}` };
-      const data = (await r.json()) as { data?: { id: string }[] };
+      if (!r.ok) {
+        void r.body?.cancel().catch(() => undefined);
+        return { ok: false, error: `HTTP ${r.status} ${r.statusText}` };
+      }
+      const data = await readProviderJson<{ data?: { id: string }[] }>(r, MAX_PROVIDER_JSON_BYTES, signal);
       return { ok: true, models: (data.data || []).map((m) => m.id) };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -146,15 +160,22 @@ export class AnthropicAdapter implements ProviderAdapter {
 
     logger.debug('anthropic', `POST ${url} model=${req.model}`);
 
+    const signal = providerRequestSignal(req.signal, PROVIDER_STREAM_TIMEOUT_MS);
+
     const response = await fetch(url, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(body),
-      signal: req.signal
+      signal
     });
 
     if (!response.ok) {
-      const errText = await response.text();
+      let errText: string;
+      try { errText = await readProviderText(response, MAX_PROVIDER_ERROR_BYTES, signal); }
+      catch (error) {
+        if (signal.aborted) throw error;
+        errText = error instanceof Error ? error.message : String(error);
+      }
       yield { type: 'error', error: `${response.status} ${response.statusText}: ${this.safeError(errText.slice(0, 500))}` };
       return;
     }
@@ -162,7 +183,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     const toolAcc = new Map<string, { id: string; name: string; arguments: string }>();
     let usage: { input_tokens?: number; output_tokens?: number } | undefined;
 
-    for await (const evt of parseSSE(response, req.signal)) {
+    for await (const evt of parseSSE(response, signal)) {
       const data = evt.data as Record<string, unknown> | undefined;
       if (!data) continue;
       const type = data.type as string;

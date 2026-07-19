@@ -52,8 +52,12 @@ export function projectCommand(): Command {
       }
       const ok = await confirm({ message: `Remove project "${p.name}"?`, default: false });
       if (ok) {
-        projectService.deleteProject(id);
-        format.printSuccess(`Project ${id} removed`);
+        try {
+          projectService.deleteProject(id);
+          format.printSuccess(`Project ${id} removed`);
+        } catch (error) {
+          format.printError(`Project removal failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
     });
 

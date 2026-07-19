@@ -3,6 +3,7 @@ import chalk from 'chalk';
 import { getContext } from '../utils/init.js';
 import * as format from '../utils/format.js';
 import { getDefaultWorkspace } from '../../../src/main/utils/paths.js';
+import { sanitizeTerminalText } from '../../../src/shared/terminal.js';
 
 export function toolCommand(): Command {
   const cmd = new Command('tool').description('Manage and run tools');
@@ -14,8 +15,8 @@ export function toolCommand(): Command {
       const { tools } = getContext();
       const list = tools.listTools();
       for (const t of list) {
-        const source = t.source.startsWith('mcp:') ? chalk.gray(t.source) : chalk.green('builtin');
-        console.log(`${source} ${chalk.bold(t.name)}: ${t.description}`);
+        const source = t.source.startsWith('mcp:') ? chalk.gray(sanitizeTerminalText(t.source)) : chalk.green('builtin');
+        console.log(`${source} ${chalk.bold(sanitizeTerminalText(t.name))}: ${sanitizeTerminalText(t.description)}`);
       }
     });
 

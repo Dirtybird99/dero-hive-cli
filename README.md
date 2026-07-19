@@ -6,7 +6,7 @@ DERO Hive CLI is a beta terminal-native AI coding workspace with multiple model 
 
 - Windows 10+, macOS 13+, or a current Linux distribution
 - Node.js 22 or later
-- npm 10 or later
+- npm 12 or later
 - Git for repository and worktree features
 - An internet connection for remote AI providers and initial installation
 
@@ -15,10 +15,10 @@ DERO Hive CLI is a beta terminal-native AI coding workspace with multiple model 
 Install directly from GitHub:
 
 ```bash
-npm install -g https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz --allow-remote=all --allow-scripts=better-sqlite3
+npm install -g --allow-remote=root --allow-scripts=better-sqlite3@11.10.0 --strict-allow-scripts https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz
 ```
 
-`--allow-remote=all` permits this command to fetch the specified GitHub release artifact. The narrow `--allow-scripts` list permits only SQLite's native binding build. Hive and its DERO MCP server ship as prebuilt JavaScript bundles and run no install scripts. Do not use `sudo npm install -g`. If npm reports a permissions error, configure a user-owned global npm directory instead.
+`--allow-remote=root` permits the requested GitHub archive without allowing remote-URL dependencies. The version-pinned script allowlist permits only SQLite's reviewed native binding build, and strict mode fails if another dependency requests an install script. Hive and its DERO MCP server ship as prebuilt JavaScript bundles and run no install scripts. These controls require npm 12. Do not use `sudo npm install -g`. If npm reports a permissions error, configure a user-owned global npm directory instead.
 
 To pin this release, replace the URL with:
 
@@ -26,7 +26,7 @@ To pin this release, replace the URL with:
 https://github.com/Dirtybird99/dero-hive-cli/releases/download/v0.2.0/dero-hive-cli.tgz
 ```
 
-The release also publishes `SHA256SUMS` for manual artifact verification.
+The release also publishes `SHA256SUMS` for manual artifact verification. Releases produced by the tagged-release workflow carry GitHub build-provenance attestations for `dero-hive-cli.tgz`; verify one with `gh attestation verify dero-hive-cli.tgz --repo Dirtybird99/dero-hive-cli` after downloading it.
 
 ### Verify the installation
 
@@ -107,7 +107,7 @@ The server checks `127.0.0.1:10102` first. If no local DERO daemon is available,
 Reinstall from the GitHub repository to get the current version:
 
 ```bash
-npm install -g https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz --allow-remote=all --allow-scripts=better-sqlite3
+npm install -g --allow-remote=root --allow-scripts=better-sqlite3@11.10.0 --strict-allow-scripts https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz
 ```
 
 DERO Hive CLI does not update itself in the background.
@@ -149,7 +149,7 @@ Install Node.js 22 or later, then reinstall DERO Hive CLI.
 `better-sqlite3` normally installs a prebuilt binary. If it does not load, reinstall with the approved scripts and a supported Node.js release:
 
 ```bash
-npm install -g https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz --allow-remote=all --allow-scripts=better-sqlite3
+npm install -g --allow-remote=root --allow-scripts=better-sqlite3@11.10.0 --strict-allow-scripts https://github.com/Dirtybird99/dero-hive-cli/releases/latest/download/dero-hive-cli.tgz
 ```
 
 ### DERO MCP server unavailable
@@ -166,7 +166,7 @@ hive mcp list
 hive --data-dir path/to/data
 ```
 
-You can also set `HIVE_DATA_DIR`. Do not run two Hive processes against the same database.
+You can also set `HIVE_DATA_DIR`. Hive uses SQLite WAL mode for safe local concurrent access. Keep each data directory on a local disk rather than a network share or synchronized folder.
 
 ## Optional DERO simulator
 
@@ -194,7 +194,10 @@ Checks:
 npm run typecheck
 npm run lint
 npm test
+npm run test:coverage
+npm run test:mcp-conformance
 npm run build
+npm run test:package
 ```
 
 See [TESTING.md](TESTING.md) for the current coverage ledger and release acceptance boundaries.
@@ -202,6 +205,8 @@ See [TESTING.md](TESTING.md) for the current coverage ledger and release accepta
 ## Data and security
 
 - Hive stores its local database, settings, logs, and secrets under `~/.hive` unless overridden.
+- On macOS and Linux, Hive-owned data directories use mode `0700` and sensitive local files use `0600`. An existing explicit `HIVE_DATA_DIR` keeps the root mode selected by its owner while Hive-owned children remain private.
+- Deleting, rewinding, or compacting a conversation removes attachment files only after no surviving conversation or fork references them.
 - Headless secret storage is machine-derived obfuscation, not an operating-system keychain. Protect the data directory accordingly.
 - Provider keys may be supplied without persistence through `HIVE_PROVIDER_<ID>_API_KEY`, using an uppercase provider id with non-alphanumeric characters replaced by underscores.
 - Do not place API keys, wallet seeds, private keys, or personal configuration in a project repository.

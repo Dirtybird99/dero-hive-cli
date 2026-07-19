@@ -4,6 +4,26 @@ import chalk from 'chalk';
 import { getContext } from '../utils/init.js';
 import * as format from '../utils/format.js';
 import type { McpServerConfig } from '../../../src/shared/types.js';
+import { sanitizeTerminalText } from '../../../src/shared/terminal.js';
+
+export function formatMcpStatusLine(status: {
+  name: string;
+  connected: boolean;
+  error?: string;
+  tools: unknown[];
+}): string {
+  const state = status.connected
+    ? chalk.green('connected')
+    : status.error
+      ? chalk.red(`error: ${sanitizeTerminalText(status.error)}`)
+      : chalk.gray('disconnected');
+  return `${sanitizeTerminalText(status.name)}: ${state} (${status.tools.length} tools)`;
+}
+
+export function formatMcpToolLine(tool: { source: string; name: string; description: string }): string {
+  const source = tool.source.startsWith('mcp:') ? chalk.gray(sanitizeTerminalText(tool.source)) : chalk.green('builtin');
+  return `${source} ${chalk.bold(sanitizeTerminalText(tool.name))}: ${sanitizeTerminalText(tool.description)}`;
+}
 
 export function mcpCommand(): Command {
   const cmd = new Command('mcp').description('Manage MCP servers');
@@ -14,10 +34,7 @@ export function mcpCommand(): Command {
     .action(async () => {
       const { mcpManager } = getContext();
       const statuses = mcpManager.getStatuses();
-      for (const s of statuses) {
-        const status = s.connected ? chalk.green('connected') : s.error ? chalk.red(`error: ${s.error}`) : chalk.gray('disconnected');
-        console.log(`${s.name}: ${status} (${s.tools.length} tools)`);
-      }
+      for (const s of statuses) console.log(formatMcpStatusLine(s));
     });
 
   cmd
@@ -95,10 +112,7 @@ export function mcpCommand(): Command {
     .action(async () => {
       const { tools } = getContext();
       const list = tools.listTools();
-      for (const t of list) {
-        const source = t.source.startsWith('mcp:') ? chalk.gray(t.source) : chalk.green('builtin');
-        console.log(`${source} ${chalk.bold(t.name)}: ${t.description}`);
-      }
+      for (const t of list) console.log(formatMcpToolLine(t));
     });
 
   return cmd;

@@ -13,7 +13,15 @@ export async function startTui(options: TuiLaunchOptions = {}): Promise<void> {
       exitOnCtrlC: false,
       patchConsole: true
     });
-    await instance.waitUntilExit();
+    const stop = (): void => instance.unmount();
+    process.once('SIGTERM', stop);
+    process.once('SIGHUP', stop);
+    try {
+      await instance.waitUntilExit();
+    } finally {
+      process.off('SIGTERM', stop);
+      process.off('SIGHUP', stop);
+    }
   } finally {
     await shutdownHive();
     if (alternateScreen) process.stdout.write('\u001B[?1049l');

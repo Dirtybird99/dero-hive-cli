@@ -1,10 +1,12 @@
 import Database from 'better-sqlite3';
-import { existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { paths } from '../utils/paths';
 import { logger } from '../utils/logger';
+import { canonicalWorkspacePath } from '../../shared/workspace';
 
 const DB_GLOBAL_KEY = '__hive_db_instance__';
+const DB_BUSY_TIMEOUT_MS = 5_000;
 
 function getGlobalDb(): Database.Database | null {
   const g = globalThis as typeof globalThis & { [DB_GLOBAL_KEY]?: Database.Database | null };
@@ -40,6 +42,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   pinned INTEGER DEFAULT 0,
   archived INTEGER DEFAULT 0,
   project_id TEXT REFERENCES projects(id),
+  workspace_path TEXT,
   parent_id TEXT,
   total_tokens INTEGER DEFAULT 0,
   message_count INTEGER DEFAULT 0,
@@ -277,19 +280,40 @@ CREATE INDEX IF NOT EXISTS idx_media_artifacts_conv ON media_artifacts(conversat
 CREATE INDEX IF NOT EXISTS idx_media_artifacts_status ON media_artifacts(status, created_at DESC);
 `;
 
-const CURRENT_SCHEMA_VERSION = 13;
+const CURRENT_SCHEMA_VERSION = 14;
 
 export async function initDb(): Promise<void> {
   const dir = dirname(paths.db);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const previous = getGlobalDb();
+  if (previous?.open) previous.close();
+  setGlobalDb(null);
+
+  const descriptor = openSync(paths.db, 'a', 0o600);
+  closeSync(descriptor);
+  if (process.platform !== 'win32') chmodSync(paths.db, 0o600);
   const db = new Database(paths.db);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  db.pragma('synchronous = NORMAL');
-  db.exec(SCHEMA);
-  runMigrations(db);
-  setGlobalDb(db);
-  logger.info('db', `initialized at ${paths.db} (schema v${CURRENT_SCHEMA_VERSION})`);
+  try {
+    // Acquire writer locks patiently across CLI processes. Set this before WAL
+    // mode because journal negotiation itself can briefly contend at startup.
+    db.pragma(`busy_timeout = ${DB_BUSY_TIMEOUT_MS}`);
+    const journalMode = db.pragma('journal_mode = WAL', { simple: true });
+    if (journalMode !== 'wal') throw new Error(`SQLite WAL mode unavailable (got ${String(journalMode)})`);
+    db.pragma('foreign_keys = ON');
+    db.pragma('synchronous = FULL');
+    db.transaction(() => db.exec(SCHEMA)).immediate();
+    runMigrations(db);
+    if (process.platform !== 'win32') {
+      for (const file of [paths.db, `${paths.db}-wal`, `${paths.db}-shm`]) {
+        if (existsSync(file)) chmodSync(file, 0o600);
+      }
+    }
+    setGlobalDb(db);
+    logger.info('db', `initialized at ${paths.db} (schema v${CURRENT_SCHEMA_VERSION})`);
+  } catch (error) {
+    if (db.open) db.close();
+    throw error;
+  }
 }
 
 interface Migration {
@@ -303,14 +327,20 @@ const MIGRATIONS: Migration[] = [
     version: 2,
     description: 'Add providers.models_fetched_at',
     up: (database) => {
-      database.exec(`ALTER TABLE providers ADD COLUMN models_fetched_at INTEGER`);
+      const columns = new Set(
+        (database.prepare('PRAGMA table_info(providers)').all() as Array<{ name: string }>).map((column) => column.name)
+      );
+      if (!columns.has('models_fetched_at')) database.exec('ALTER TABLE providers ADD COLUMN models_fetched_at INTEGER');
     }
   },
   {
     version: 3,
     description: 'Rename project_path to project_id and add projects table',
     up: (database) => {
-      database.exec(`ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)`);
+      const columns = new Set(
+        (database.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>).map((column) => column.name)
+      );
+      if (!columns.has('project_id')) database.exec('ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)');
       database.exec(`CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -326,16 +356,22 @@ const MIGRATIONS: Migration[] = [
     version: 4,
     description: 'Add parent_id to conversations for fork lineage',
     up: (database) => {
-      database.exec(`ALTER TABLE conversations ADD COLUMN parent_id TEXT`);
+      const columns = new Set(
+        (database.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>).map((column) => column.name)
+      );
+      if (!columns.has('parent_id')) database.exec('ALTER TABLE conversations ADD COLUMN parent_id TEXT');
     }
   },
   {
     version: 5,
     description: 'Add compaction telemetry fields to conversations',
     up: (database) => {
-      database.exec(`ALTER TABLE conversations ADD COLUMN compaction_count INTEGER DEFAULT 0`);
-      database.exec(`ALTER TABLE conversations ADD COLUMN last_compaction_at INTEGER`);
-      database.exec(`ALTER TABLE conversations ADD COLUMN tokens_saved_by_compaction INTEGER DEFAULT 0`);
+      const columns = new Set(
+        (database.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>).map((column) => column.name)
+      );
+      if (!columns.has('compaction_count')) database.exec('ALTER TABLE conversations ADD COLUMN compaction_count INTEGER DEFAULT 0');
+      if (!columns.has('last_compaction_at')) database.exec('ALTER TABLE conversations ADD COLUMN last_compaction_at INTEGER');
+      if (!columns.has('tokens_saved_by_compaction')) database.exec('ALTER TABLE conversations ADD COLUMN tokens_saved_by_compaction INTEGER DEFAULT 0');
     }
   },
   {
@@ -567,33 +603,52 @@ const MIGRATIONS: Migration[] = [
         `);
       }
     }
+  },
+  {
+    version: 14,
+    description: 'Bind conversations to canonical workspace paths',
+    up: (database) => {
+      const columns = new Set(
+        (database.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>).map((column) => column.name)
+      );
+      // Older builds could record v5 after its first duplicate column and
+      // leave the other two effects missing. v14 is the first safe repair
+      // point for databases that already carry that incorrect version row.
+      if (!columns.has('compaction_count')) database.exec('ALTER TABLE conversations ADD COLUMN compaction_count INTEGER DEFAULT 0');
+      if (!columns.has('last_compaction_at')) database.exec('ALTER TABLE conversations ADD COLUMN last_compaction_at INTEGER');
+      if (!columns.has('tokens_saved_by_compaction')) database.exec('ALTER TABLE conversations ADD COLUMN tokens_saved_by_compaction INTEGER DEFAULT 0');
+      if (!columns.has('workspace_path')) database.exec('ALTER TABLE conversations ADD COLUMN workspace_path TEXT');
+      const rows = database.prepare(`
+        SELECT conversations.id, projects.path
+        FROM conversations
+        JOIN projects ON projects.id = conversations.project_id
+        WHERE conversations.workspace_path IS NULL
+      `).all() as Array<{ id: string; path: string }>;
+      const update = database.prepare('UPDATE conversations SET workspace_path = ? WHERE id = ?');
+      for (const row of rows) {
+        try { update.run(canonicalWorkspacePath(row.path), row.id); }
+        catch { /* unavailable legacy projects remain unscoped and fail closed */ }
+      }
+    }
   }
 ];
 
 function runMigrations(database: Database.Database): void {
-  // Get current version (0 if no row exists)
-  const versionRow = database.prepare('SELECT MAX(version) AS v FROM schema_version').get() as { v: number | null } | undefined;
-  const currentVersion = versionRow?.v ?? 0;
-
   for (const migration of MIGRATIONS) {
-    if (migration.version <= currentVersion) continue;
     try {
-      database.transaction(() => {
+      const applied = database.transaction(() => {
+        // Recheck after acquiring the writer lock. Another process may have
+        // completed this migration while this connection was waiting.
+        const versionRow = database.prepare('SELECT MAX(version) AS version FROM schema_version').get() as { version: number | null } | undefined;
+        if ((versionRow?.version ?? 0) >= migration.version) return false;
         migration.up(database);
-        database.prepare('INSERT INTO schema_version (version, applied_at) VALUES (?, ?)').run(migration.version, Date.now());
-      })();
-      logger.info('db', `migration v${migration.version} applied: ${migration.description}`);
+        database.prepare('INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)').run(migration.version, Date.now());
+        return true;
+      }).immediate();
+      if (applied) logger.info('db', `migration v${migration.version} applied: ${migration.description}`);
     } catch (err) {
-      // If the column already exists (e.g. half-applied before), record it as done
-      if (err instanceof Error && /duplicate column name/i.test(err.message)) {
-        logger.warn('db', `migration v${migration.version} skipped (already applied): ${migration.description}`);
-        try {
-          database.prepare('INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)').run(migration.version, Date.now());
-        } catch { /* swallow */ }
-      } else {
-        logger.error('db', `migration v${migration.version} failed: ${migration.description}`, err);
-        throw err;
-      }
+      logger.error('db', `migration v${migration.version} failed: ${migration.description}`, err);
+      throw err;
     }
   }
 }

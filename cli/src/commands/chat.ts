@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, readFileSync, existsSync, writeFileSync, statSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -11,13 +11,17 @@ import * as config from '../utils/config.js';
 import * as conversationService from '../services/conversation.js';
 import * as projectService from '../services/project.js';
 import { runChat } from '../services/chat.js';
-import { listProviders } from '../../../src/main/providers/registry.js';
-import { paths, getDefaultWorkspace } from '../../../src/main/utils/paths.js';
+import { closeConversationSessions, listProviders } from '../../../src/main/providers/registry.js';
+import { ensurePrivateDataDir, paths, getDefaultWorkspace } from '../../../src/main/utils/paths.js';
 import { getDb, getSetting } from '../../../src/main/db/client.js';
 import type { HookDefinition } from '../../../src/main/hooks/types.js';
 import type { Message, TokenUsage } from '../../../src/shared/types.js';
 import { APP_VERSION } from '../../../src/shared/version.js';
+import { sanitizeTerminalText } from '../../../src/shared/terminal.js';
+import { canonicalWorkspacePath, sameWorkspacePath } from '../../../src/shared/workspace.js';
 import { loadBundledSkills, loadUserSkills } from '../../../src/main/skills/loader.js';
+import { deleteStoredAttachments, MAX_ATTACHMENT_BYTES, storeAttachment } from '../../../src/main/utils/attachments.js';
+import { resolveAndValidate } from '../../../src/main/utils/pathPolicy.js';
 
 // ── Command registry ──────────────────────────────────────────────────
 const SLASH_COMMANDS: Record<string, string> = {
@@ -28,7 +32,7 @@ const SLASH_COMMANDS: Record<string, string> = {
   'list': 'List all conversations',
   'sessions': 'List all conversations',
   'rename': 'Rename current conversation  /rename <title>',
-  'delete': 'Delete a conversation  /delete [id]',
+  'delete': 'Delete a conversation  /delete [id] confirm',
   'search': 'Search conversations  /search <query>',
   'export': 'Export conversation as markdown  /export [id]',
   'fork': 'Fork the current conversation',
@@ -67,8 +71,41 @@ const SLASH_COMMANDS: Record<string, string> = {
   'usage': 'Show detailed token usage',
 };
 
-const HISTORY_FILE = path.join(paths.userData, 'cli', 'history.txt');
+const historyFile = (): string => path.join(paths.cli, 'history.txt');
 const MAX_HISTORY = 1000;
+
+function writePrivateCliFile(file: string, content: string): void {
+  ensurePrivateDataDir(path.dirname(file));
+  writeFileSync(file, content, { encoding: 'utf8', mode: 0o600 });
+  if (process.platform !== 'win32') chmodSync(file, 0o600);
+}
+
+export function consumeClassicCancelInput(
+  previousTail: string,
+  chunk: string,
+  responseActive: boolean
+): { tail: string; cancel: boolean } {
+  const tail = `${previousTail}${chunk}`.slice(-32);
+  const requested = chunk.includes('\x03') || /(?:^|\r?\n)\/stop(?:\r?\n|$)/u.test(tail);
+  return { tail: requested ? '' : tail, cancel: requested && responseActive };
+}
+
+export function formatClassicSearchResult(conversationId: string, snippet: string): string {
+  return `  ${chalk.bold(sanitizeTerminalText(conversationId.slice(0, 8)))}  ${sanitizeTerminalText(snippet)}`;
+}
+
+export function parseClassicDeleteRequest(
+  argument: string,
+  currentConversationId: string
+): { targetId: string; confirmed: boolean; error?: string } {
+  const parts = argument.trim().split(/\s+/u).filter(Boolean);
+  const confirmed = parts.at(-1)?.toLowerCase() === 'confirm';
+  if (confirmed) parts.pop();
+  if (parts.length > 1) {
+    return { targetId: currentConversationId, confirmed: false, error: 'Usage: /delete [id] confirm' };
+  }
+  return { targetId: parts[0] || currentConversationId, confirmed };
+}
 
 // ── In-memory session state ───────────────────────────────────────────
 const sessionUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -83,8 +120,11 @@ let currentAbortController: AbortController | null = null;
 // ── History helpers ───────────────────────────────────────────────────
 function loadHistory(): string[] {
   try {
-    if (existsSync(HISTORY_FILE)) {
-      return readFileSync(HISTORY_FILE, 'utf-8').split('\n').filter(Boolean).reverse();
+    ensurePrivateDataDir(paths.cli);
+    const file = historyFile();
+    if (existsSync(file)) {
+      if (process.platform !== 'win32') chmodSync(file, 0o600);
+      return readFileSync(file, 'utf-8').split('\n').filter(Boolean).reverse();
     }
   } catch { /* ignore */ }
   return [];
@@ -93,9 +133,7 @@ function loadHistory(): string[] {
 function saveHistory(history: string[] | undefined): void {
   if (!history) return;
   try {
-    const dir = path.dirname(HISTORY_FILE);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(HISTORY_FILE, history.slice(0, MAX_HISTORY).reverse().join('\n') + '\n');
+    writePrivateCliFile(historyFile(), history.slice(0, MAX_HISTORY).reverse().join('\n') + '\n');
   } catch { /* ignore */ }
 }
 
@@ -148,6 +186,40 @@ async function runChatSession(oneShotPrompt?: string, options: {
     sessionPlanMode = state.planMode || false;
     sessionAddedDirs.splice(0, sessionAddedDirs.length, ...(state.addedDirs || []));
 
+    const failStartup = (message: string): void => {
+      if (oneShotPrompt && options.json) {
+        console.log(JSON.stringify(buildJsonResult({
+          ok: false,
+          conversationId: '',
+          messageId: '',
+          content: '',
+          toolCalls: [],
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          error: message
+        })));
+      } else {
+        format.printError(message);
+      }
+      process.exitCode = 1;
+    };
+
+    const requestedCwd = options.cwd || process.env.HIVE_LAUNCH_CWD;
+    let activeProject = options.project ? projectService.getProject(options.project) : null;
+    if (options.project) {
+      if (!activeProject) {
+        failStartup(`Project does not exist or has no valid directory: ${options.project}`);
+        return;
+      }
+    }
+    let currentProjectPath: string;
+    try {
+      currentProjectPath = canonicalWorkspacePath(activeProject?.path || requestedCwd || state.currentProjectPath || getDefaultWorkspace());
+    } catch {
+      failStartup(`Workspace directory does not exist or is not a directory: ${activeProject?.path || requestedCwd || state.currentProjectPath}`);
+      return;
+    }
+    activeProject = projectService.getProjectByPath(currentProjectPath);
+
     let providerId = options.provider || state.currentProviderId;
     let modelId = options.model || state.currentModelId;
     if (!providerId || !modelId) {
@@ -158,53 +230,64 @@ async function runChatSession(oneShotPrompt?: string, options: {
     if (!providerId || !modelId) {
       const providers = listProviders().filter((p) => p.enabled);
       if (providers.length === 0) {
-        const msg = 'No providers configured. Run `hive provider add` first.';
-        if (oneShotPrompt && options.json) {
-          console.log(JSON.stringify(buildJsonResult({
-            ok: false, conversationId: '', messageId: '', content: '', toolCalls: [],
-            usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, error: msg
-          })));
-        } else {
-          format.printError(msg);
-        }
-        if (oneShotPrompt) process.exitCode = 1;
+        failStartup('No providers configured. Run `hive provider add` first.');
         return;
       }
       providerId = providers[0].id;
       modelId = providers[0].models[0]?.id || '';
     }
 
-    let conversationId = options.conversation;
-    const launchCwd = options.cwd || process.env.HIVE_LAUNCH_CWD;
-    let currentProjectPath = launchCwd && existsSync(launchCwd)
-      ? path.resolve(launchCwd)
-      : state.currentProjectPath || getDefaultWorkspace();
+    let conversation = options.conversation ? conversationService.getConversation(options.conversation) : null;
+    if (options.conversation && !conversation) {
+      failStartup(`Conversation does not exist: ${options.conversation}`);
+      return;
+    }
+    if (conversation) {
+      if (!conversation.workspacePath) {
+        failStartup('The requested conversation has no workspace scope. Start a new conversation in this workspace.');
+        return;
+      }
+      if ((requestedCwd || options.project) && !sameWorkspacePath(currentProjectPath, conversation.workspacePath)) {
+        failStartup('The requested conversation belongs to a different workspace.');
+        return;
+      }
+      try { currentProjectPath = canonicalWorkspacePath(conversation.workspacePath); }
+      catch {
+        failStartup('The requested conversation workspace is unavailable.');
+        return;
+      }
+      activeProject = projectService.getProjectByPath(currentProjectPath);
+    }
+
+    let conversationId = conversation?.id;
     const projectDir = (): string => state.currentProjectPath || currentProjectPath;
     if (!conversationId) {
-      const convs = conversationService.listConversations();
-      if (convs.length > 0) {
-        conversationId = convs[0].id;
-        if (!state.currentProviderId && convs[0].providerId) {
-          providerId = convs[0].providerId;
-          modelId = (convs[0].model && convs[0].model !== 'unknown') ? convs[0].model : modelId;
-        }
-      } else {
-        conversationId = conversationService.createConversation({
+      if (!oneShotPrompt && state.currentConversationId) {
+        const candidate = conversationService.getConversation(state.currentConversationId);
+        if (candidate && sameWorkspacePath(candidate.workspacePath, currentProjectPath)) conversation = candidate;
+      }
+      if (!conversation && !oneShotPrompt) {
+        conversation = conversationService.listConversationsForWorkspace(currentProjectPath)[0] || null;
+      }
+      if (!conversation) {
+        conversation = conversationService.createConversation({
           providerId, model: modelId,
           systemPrompt: options.system,
-          projectId: options.project
-        }).id;
+          projectId: activeProject?.id,
+          workspacePath: currentProjectPath
+        });
       }
+      conversationId = conversation.id;
     }
-    // If a project option was given, also resolve its path
-    if (options.project) {
-      const proj = projectService.getProject(options.project);
-      if (proj) currentProjectPath = proj.path;
+    if (!options.provider && conversation?.providerId) {
+      providerId = conversation.providerId;
+      if (!options.model && conversation.model && conversation.model !== 'unknown') modelId = conversation.model;
     }
 
     state.currentProviderId = providerId;
     state.currentModelId = modelId;
     state.currentConversationId = conversationId;
+    state.currentProjectId = activeProject?.id;
     state.currentProjectPath = currentProjectPath;
     config.setSettingDirect('workingDirectory', currentProjectPath);
     config.saveState(state);
@@ -219,8 +302,8 @@ async function runChatSession(oneShotPrompt?: string, options: {
     const conv = conversationService.getConversation(conversationId);
     const convTitle = conv?.title || 'New chat';
     console.log(chalk.cyan('\n  Hive CLI  ') + chalk.gray('— type messages, /help for commands'));
-    console.log(chalk.gray(`  ${providerId}/${modelId}  ·  ${convTitle}`));
-    if (sessionGoal) console.log(chalk.yellow(`  [goal] ${sessionGoal}`));
+    console.log(chalk.gray(`  ${sanitizeTerminalText(providerId)}/${sanitizeTerminalText(modelId)}  ·  ${sanitizeTerminalText(convTitle)}`));
+    if (sessionGoal) console.log(chalk.yellow(`  [goal] ${sanitizeTerminalText(sessionGoal)}`));
 
     const existingMessages = conversationService.getMessages(conversationId);
     for (const msg of existingMessages) {
@@ -231,7 +314,7 @@ async function runChatSession(oneShotPrompt?: string, options: {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
-      terminal: true,
+      terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
       completer: (line: string): [string[], string] => {
         const hits: string[] = [];
         if (line.startsWith('/')) {
@@ -259,10 +342,9 @@ async function runChatSession(oneShotPrompt?: string, options: {
     let cancelInputTail = '';
     const cancelFromInput = (chunk: Buffer | string): void => {
       const text = chunk.toString();
-      cancelInputTail = `${cancelInputTail}${text}`.slice(-32);
-      if (currentAbortController && (text.includes('\x03') || /(?:^|\r?\n)\/stop(?:\r?\n|$)/u.test(cancelInputTail))) {
-        currentAbortController.abort();
-      }
+      const next = consumeClassicCancelInput(cancelInputTail, text, currentAbortController !== null);
+      cancelInputTail = next.tail;
+      if (next.cancel) currentAbortController?.abort();
     };
     process.stdin.on('data', cancelFromInput);
 
@@ -272,13 +354,16 @@ async function runChatSession(oneShotPrompt?: string, options: {
     let inputBuffer: string[] = [];
     let inputTimer: ReturnType<typeof setTimeout> | null = null;
     let sending = false;
+    let inputChain = Promise.resolve();
 
     function flushInput(): void {
       if (inputBuffer.length === 0) return;
       const text = inputBuffer.join('\n');
       inputBuffer = [];
       inputTimer = null;
-      processInput(text);
+      inputChain = inputChain.then(() => processInput(text)).catch((error) => {
+        format.printError(error instanceof Error ? error.message : String(error));
+      });
     }
 
     async function processInput(text: string): Promise<void> {
@@ -295,9 +380,11 @@ async function runChatSession(oneShotPrompt?: string, options: {
         const handled = await handleSlashCommand(trimmed, state, conversationId!, providerId!, modelId!, projectDir());
         if (handled === 'quit') { rl.close(); return; }
         if (handled === 'new') {
+          await closeConversationSessions(conversationId!);
           conversationId = conversationService.createConversation({
             providerId, model: modelId,
-            projectId: state.currentProjectId
+            projectId: state.currentProjectId,
+            workspacePath: projectDir()
           }).id;
           state.currentConversationId = conversationId;
           config.saveState(state);
@@ -342,7 +429,9 @@ async function runChatSession(oneShotPrompt?: string, options: {
     });
     process.stdin.off('data', cancelFromInput);
 
-    if (inputTimer) { clearTimeout(inputTimer); flushInput(); }
+    if (inputTimer) clearTimeout(inputTimer);
+    flushInput();
+    await inputChain;
     saveHistory((rl as unknown as { history?: string[] }).history);
     console.log(chalk.gray('Goodbye.'));
   } finally {
@@ -358,15 +447,15 @@ function showConversationList(): void {
     const date = new Date(c.updatedAt).toLocaleString();
     const preview = c.preview ? c.preview.slice(0, 60) : '';
     const tag = c.id === conversationIdRef ? chalk.green(' *') : '';
-    console.log(`  ${chalk.bold(c.id.slice(0, 8))}${tag}  ${chalk.cyan(c.title)}  ${chalk.gray(`${c.messageCount} msgs, ${date}`)}`);
-    if (preview) console.log(`         ${chalk.gray(preview)}`);
+    console.log(`  ${chalk.bold(c.id.slice(0, 8))}${tag}  ${chalk.cyan(sanitizeTerminalText(c.title))}  ${chalk.gray(`${c.messageCount} msgs, ${date}`)}`);
+    if (preview) console.log(`         ${chalk.gray(sanitizeTerminalText(preview))}`);
   }
 }
 
 let conversationIdRef = '';
 
 function printMessage(msg: Message): void {
-  const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content, null, 2);
+  const content = sanitizeTerminalText(typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content, null, 2));
   if (msg.role === 'user') {
     console.log(chalk.green('\n  You  ') + content);
   } else if (msg.role === 'assistant') {
@@ -375,7 +464,7 @@ function printMessage(msg: Message): void {
     if (rendered) console.log(rendered);
     if (msg.toolCalls?.length) {
       for (const tc of msg.toolCalls) {
-        console.log(chalk.yellow(`  [tool] ${tc.function.name}(${tc.function.arguments})`));
+        console.log(chalk.yellow(`  [tool] ${sanitizeTerminalText(tc.function.name)}(${sanitizeTerminalText(tc.function.arguments)})`));
       }
     }
     if (msg.usage) {
@@ -384,7 +473,7 @@ function printMessage(msg: Message): void {
     }
   } else if (msg.role === 'tool') {
     const snippet = content.length > 200 ? content.slice(0, 200) + '...' : content;
-    console.log(chalk.gray(`  [result] ${msg.name}: ${snippet}`));
+    console.log(chalk.gray(`  [result] ${sanitizeTerminalText(msg.name || 'tool')}: ${snippet}`));
   }
 }
 
@@ -466,7 +555,7 @@ async function sendMessage(
   };
   messages.push(userMsg);
 
-  if (!json) console.log(chalk.green('\n  You  ') + prompt);
+  if (!json) console.log(chalk.green('\n  You  ') + sanitizeTerminalText(prompt));
 
   const abort = new AbortController();
   currentAbortController = abort;
@@ -475,7 +564,7 @@ async function sendMessage(
   let content = '';
   let firstDelta = true;
   let hadToolCalls = false;
-  let turnUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  const turnUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   let failed = false;
   let errorMessage: string | undefined;
   let messageId = '';
@@ -503,7 +592,7 @@ async function sendMessage(
                 firstDelta = false;
                 process.stdout.write(chalk.magenta('\n  Assistant'));
               }
-              process.stdout.write(event.content);
+              process.stdout.write(sanitizeTerminalText(event.content));
             }
             content += event.content;
           } else if (event.type === 'tool_calls') {
@@ -513,7 +602,9 @@ async function sendMessage(
               hadToolCalls = true;
             }
           } else if (event.type === 'usage') {
-            turnUsage = event.usage;
+            turnUsage.promptTokens += event.usage.promptTokens;
+            turnUsage.completionTokens += event.usage.completionTokens;
+            turnUsage.totalTokens += event.usage.totalTokens;
           } else if (event.type === 'error') {
             failed = true;
             errorMessage = event.error;
@@ -532,11 +623,12 @@ async function sendMessage(
             durationMs: info.durationMs
           });
           if (!json) {
-            const argsStr = JSON.stringify(info.args).slice(0, 100);
-            const resultSnippet = info.result.content.length > 200
-              ? info.result.content.slice(0, 200) + '...'
-              : info.result.content;
-            console.log(chalk.yellow(`  [tool] ${info.toolName}(${argsStr})`));
+            const argsStr = sanitizeTerminalText(JSON.stringify(info.args)).slice(0, 100);
+            const safeResult = sanitizeTerminalText(info.result.content);
+            const resultSnippet = safeResult.length > 200
+              ? safeResult.slice(0, 200) + '...'
+              : safeResult;
+            console.log(chalk.yellow(`  [tool] ${sanitizeTerminalText(info.toolName)}(${argsStr})`));
             if (info.result.isError) {
               console.log(chalk.red(`  [error] ${resultSnippet}`));
             } else {
@@ -597,6 +689,63 @@ function clearTooltip(): void {
   process.stdout.write('\r\x1b[K');
 }
 
+export async function switchClassicWorkspace(
+  state: config.CliState,
+  conversationId: string,
+  providerId: string,
+  modelId: string,
+  nextPath: string
+): Promise<ReturnType<typeof conversationService.createConversation>> {
+  const workspacePath = canonicalWorkspacePath(nextPath, state.currentProjectPath || process.cwd());
+  const project = projectService.getProjectByPath(workspacePath);
+  await closeConversationSessions(conversationId);
+  const conversation = conversationService.createConversation({
+    providerId,
+    model: modelId,
+    systemPrompt: state.systemPrompt,
+    projectId: project?.id,
+    workspacePath
+  });
+  state.currentConversationId = conversation.id;
+  state.currentProjectId = project?.id;
+  state.currentProjectPath = workspacePath;
+  config.setSettingDirect('workingDirectory', workspacePath);
+  config.saveState(state);
+  return conversation;
+}
+
+export async function attachClassicFile(conversationId: string, input: string, cwd: string): Promise<string> {
+  const absolute = resolveAndValidate(input, cwd);
+  const size = statSync(absolute).size;
+  if (size > MAX_ATTACHMENT_BYTES) throw new Error(`Attachment exceeds the ${MAX_ATTACHMENT_BYTES}-byte size limit.`);
+  const id = await storeAttachment(readFileSync(absolute));
+  try {
+    const message: Message = {
+      id: randomUUID(),
+      role: 'user',
+      content: [
+        { type: 'text', text: `Attached file: ${input}` },
+        {
+          type: 'attachment_ref',
+          attachment: {
+            id,
+            type: 'file',
+            filename: path.basename(absolute),
+            mimeType: 'application/octet-stream',
+            size
+          }
+        }
+      ],
+      createdAt: Date.now()
+    };
+    conversationService.persistMessage(conversationId, message);
+    return absolute;
+  } catch (error) {
+    await deleteStoredAttachments([id]);
+    throw error;
+  }
+}
+
 // ── Slash command handlers ────────────────────────────────────────────
 async function handleSlashCommand(
   prompt: string,
@@ -638,13 +787,36 @@ async function handleSlashCommand(
     }
 
     case 'delete': {
-      const targetId = arg || conversationId;
+      const { targetId, confirmed, error } = parseClassicDeleteRequest(arg, conversationId);
+      if (error) { format.printError(error); break; }
       const conv = conversationService.getConversation(targetId);
       if (!conv) { format.printError(`Conversation ${targetId} not found`); break; }
-      conversationService.deleteConversation(targetId);
+      if (!confirmed) {
+        format.printInfo(`Deletion is permanent. Run: /delete ${targetId} confirm`);
+        break;
+      }
+      await closeConversationSessions(targetId);
+      let attachmentCleanupError: string | undefined;
+      try {
+        await conversationService.deleteConversation(targetId);
+      } catch (error) {
+        if (conversationService.getConversation(targetId)) throw error;
+        attachmentCleanupError = error instanceof Error ? error.message : String(error);
+      }
       format.printSuccess(`Deleted: ${conv.title}`);
+      if (attachmentCleanupError) format.printError(`Attachment cleanup failed: ${attachmentCleanupError}`);
       if (targetId === conversationId) {
-        format.printInfo('Deleted active conversation. Use /new to start fresh.');
+        const replacement = conversationService.createConversation({
+          providerId,
+          model: modelId,
+          systemPrompt: state.systemPrompt,
+          projectId: state.currentProjectId,
+          workspacePath: cwd
+        });
+        state.currentConversationId = replacement.id;
+        config.saveState(state);
+        format.printInfo(`Started replacement conversation ${replacement.id.slice(0, 8)}.`);
+        return 'refresh';
       }
       break;
     }
@@ -654,7 +826,7 @@ async function handleSlashCommand(
       const results = conversationService.searchConversations(arg);
       if (results.length === 0) { format.printInfo('No matches.'); break; }
       for (const r of results) {
-        console.log(`  ${chalk.bold(r.conversationId.slice(0, 8))}  ${r.snippet}`);
+        console.log(formatClassicSearchResult(r.conversationId, r.snippet));
       }
       break;
     }
@@ -671,9 +843,8 @@ async function handleSlashCommand(
         const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2);
         md += `### ${label}\n\n${c}\n\n`;
       }
-      const outFile = path.join(paths.userData, 'cli', `export-${targetId.slice(0, 8)}.md`);
-      mkdirSync(path.dirname(outFile), { recursive: true });
-      writeFileSync(outFile, md);
+      const outFile = path.join(paths.cli, `export-${targetId.slice(0, 8)}.md`);
+      writePrivateCliFile(outFile, md);
       format.printSuccess(`Exported to ${outFile}`);
       break;
     }
@@ -698,11 +869,11 @@ async function handleSlashCommand(
           message: 'Select project',
           choices: projects.map((p) => ({ value: p.id, name: `${p.icon} ${p.name}` }))
         });
-        state.currentProjectId = id;
         const proj = projectService.getProject(id);
-        if (proj) state.currentProjectPath = proj.path;
-        config.saveState(state);
-        format.printSuccess(`Project set to ${id}`);
+        if (!proj) { format.printError(`Project ${id} not found`); break; }
+        const created = await switchClassicWorkspace(state, conversationId, providerId, modelId, proj.path);
+        format.printSuccess(`Project set to ${id}; started conversation ${created.id.slice(0, 8)}`);
+        return 'refresh';
       }
       break;
     }
@@ -758,13 +929,13 @@ async function handleSlashCommand(
       const { tools } = getContext();
       const list = tools.listTools();
       for (const t of list) {
-        console.log(`${t.source} ${chalk.bold(t.name)}: ${t.description}`);
+        console.log(`${sanitizeTerminalText(t.source)} ${chalk.bold(sanitizeTerminalText(t.name))}: ${sanitizeTerminalText(t.description)}`);
       }
       break;
     }
 
     case 'compact': {
-      const result = conversationService.compactConversation(conversationId, 8, arg || undefined);
+      const result = await conversationService.compactConversation(conversationId, 8, arg || undefined);
       if (result.removedCount) format.printSuccess(`Compacted ${result.removedCount} messages and freed about ${result.tokensSaved} tokens.`);
       else format.printInfo('There is not enough history to compact.');
       break;
@@ -774,7 +945,7 @@ async function handleSlashCommand(
       const rows = getDb().prepare('SELECT key, value FROM settings ORDER BY key').all() as Array<{ key: string; value: string }>;
       if (rows.length === 0) { format.printInfo('No settings.'); break; }
       for (const row of rows) {
-        console.log(`  ${chalk.bold(row.key)}: ${row.value.slice(0, 200)}`);
+        console.log(`  ${chalk.bold(sanitizeTerminalText(row.key))}: ${sanitizeTerminalText(row.value).slice(0, 200)}`);
       }
       break;
     }
@@ -782,19 +953,8 @@ async function handleSlashCommand(
     case 'file': {
       if (!arg) { format.printError('Usage: /file <path>'); break; }
       try {
-        const data = readFileSync(path.resolve(arg));
-        const b64 = data.toString('base64');
-        const userMsg: Message = {
-          id: randomUUID(),
-          role: 'user',
-          content: [
-            { type: 'text', text: `Attached file: ${arg}` },
-            { type: 'file', file: { filename: path.basename(arg), data: b64, mimeType: 'application/octet-stream' } }
-          ],
-          createdAt: Date.now()
-        };
-        conversationService.persistMessage(conversationId, userMsg);
-        format.printSuccess(`File attached: ${arg}`);
+        const absolute = await attachClassicFile(conversationId, arg, cwd);
+        format.printSuccess(`File attached: ${absolute}`);
       } catch (err) {
         format.printError(`Failed to attach file: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -816,16 +976,16 @@ async function handleSlashCommand(
 
     case 'cd': {
       if (!arg) { format.printError('Usage: /cd <path>'); break; }
-      const cdTarget = path.resolve(arg);
-      if (!existsSync(cdTarget)) { format.printError(`Directory not found: ${cdTarget}`); break; }
+      let cdTarget: string;
+      try { cdTarget = canonicalWorkspacePath(arg, cwd); }
+      catch { format.printError(`Directory not found: ${path.resolve(cwd, arg)}`); break; }
       if (!existsSync(path.join(cdTarget, '.git')) && !existsSync(path.join(cdTarget, 'package.json'))) {
         const { confirm } = await import('@inquirer/prompts');
         const ok = await confirm({ message: `"${cdTarget}" doesn't look like a project. Proceed?`, default: false });
         if (!ok) break;
       }
-      state.currentProjectPath = cdTarget;
-      config.saveState(state);
-      format.printSuccess(`Working directory changed to ${cdTarget}`);
+      const created = await switchClassicWorkspace(state, conversationId, providerId, modelId, cdTarget);
+      format.printSuccess(`Working directory changed to ${cdTarget}; started conversation ${created.id.slice(0, 8)}`);
       return 'refresh';
     }
 
@@ -835,7 +995,7 @@ async function handleSlashCommand(
         const appSettings = config.getSettingDirect<Record<string, unknown>>('appSettings') || {};
         console.log(chalk.bold('Settings:'));
         for (const [k, v] of Object.entries(appSettings)) {
-          console.log(`  ${chalk.cyan(k)} = ${JSON.stringify(v)}`);
+          console.log(`  ${chalk.cyan(sanitizeTerminalText(k))} = ${sanitizeTerminalText(JSON.stringify(v))}`);
         }
         break;
       }
@@ -891,7 +1051,7 @@ async function handleSlashCommand(
       } catch {
         // Fallback: print to stdout for manual copy
         console.log(chalk.gray('\n--- copy content ---'));
-        console.log(text);
+        console.log(sanitizeTerminalText(text));
         console.log(chalk.gray('--- end copy ---'));
       }
       break;
@@ -926,15 +1086,16 @@ async function handleSlashCommand(
           break;
         }
         // Show summary
-        const files = execSync('git diff --stat', { cwd: dir, encoding: 'utf-8', timeout: 5000 });
+        const files = sanitizeTerminalText(execSync('git diff --stat', { cwd: dir, encoding: 'utf-8', timeout: 5000 }));
+        const safeDiff = sanitizeTerminalText(diff);
         console.log(chalk.bold('\nUncommitted changes:'));
         console.log(chalk.gray(files.trim()));
         // Show first 2000 chars of diff
-        if (diff.length > 2000) {
-          console.log(chalk.gray(diff.slice(0, 2000) + '...'));
-          console.log(chalk.gray(`  (${diff.length} total chars — truncated)`));
+        if (safeDiff.length > 2000) {
+          console.log(chalk.gray(safeDiff.slice(0, 2000) + '...'));
+          console.log(chalk.gray(`  (${safeDiff.length} total chars — truncated)`));
         } else {
-          console.log(chalk.gray(diff));
+          console.log(chalk.gray(safeDiff));
         }
       } catch (err) {
         format.printError(`Git diff failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -973,8 +1134,8 @@ async function handleSlashCommand(
       }
       console.log(chalk.bold('Lifecycle hooks:'));
       for (const h of hooks) {
-        const scope = h.toolPattern ? ` [${h.toolPattern}]` : '';
-        console.log(`  ${chalk.cyan(h.event)}${scope} → ${h.command}${h.blocking ? chalk.yellow(' (blocking)') : ''}`);
+        const scope = h.toolPattern ? ` [${sanitizeTerminalText(h.toolPattern)}]` : '';
+        console.log(`  ${chalk.cyan(sanitizeTerminalText(h.event))}${scope} → ${sanitizeTerminalText(h.command)}${h.blocking ? chalk.yellow(' (blocking)') : ''}`);
       }
       break;
     }
@@ -1016,8 +1177,8 @@ async function handleSlashCommand(
         const statuses = mcpManager.getStatuses();
         if (statuses.length === 0) { format.printInfo('No MCP servers configured.'); break; }
         for (const s of statuses) {
-          const st = s.connected ? chalk.green('connected') : s.error ? chalk.red(`error: ${s.error}`) : chalk.gray('disconnected');
-          console.log(`  ${chalk.bold(s.name)}: ${st} (${s.tools.length} tools)`);
+          const st = s.connected ? chalk.green('connected') : s.error ? chalk.red(`error: ${sanitizeTerminalText(s.error)}`) : chalk.gray('disconnected');
+          console.log(`  ${chalk.bold(sanitizeTerminalText(s.name))}: ${st} (${s.tools.length} tools)`);
         }
       } else if (sub === 'connect') {
         const id = args[1];
@@ -1047,7 +1208,7 @@ async function handleSlashCommand(
         if (sessionMemory.length === 0) { format.printInfo('No session memory. Use /memory <text> to add a note.'); break; }
         console.log(chalk.bold('Session memory:'));
         for (let i = 0; i < sessionMemory.length; i++) {
-          console.log(`  ${i + 1}. ${sessionMemory[i]}`);
+          console.log(`  ${i + 1}. ${sanitizeTerminalText(sessionMemory[i])}`);
         }
       } else if (arg.startsWith('delete ') || arg.startsWith('rm ')) {
         const idx = parseInt(arg.split(' ')[1], 10) - 1;
@@ -1091,7 +1252,7 @@ async function handleSlashCommand(
       } else if (arg === 'list' || !arg) {
         console.log(chalk.bold('Permission rules:'));
         for (const r of rules) {
-          console.log(`  ${chalk.cyan(r.toolName)} → ${chalk.bold(r.action)}${r.scope ? ` (${r.scope})` : ''}`);
+          console.log(`  ${chalk.cyan(sanitizeTerminalText(r.toolName))} → ${chalk.bold(r.action)}${r.scope ? ` (${sanitizeTerminalText(r.scope)})` : ''}`);
         }
       } else {
         format.printError('Usage: /permissions [list|add <tool> <allow|deny|ask>]');
@@ -1137,7 +1298,7 @@ async function handleSlashCommand(
 
     case 'rewind':
     case 'undo': {
-      const removed = conversationService.removeLastExchange(conversationId);
+      const removed = await conversationService.removeLastExchange(conversationId);
       if (!removed) format.printError('Nothing to rewind.');
       else format.printSuccess(`Removed ${removed} message(s).`);
       break;
@@ -1157,12 +1318,12 @@ async function handleSlashCommand(
     case 'status': {
       const conv = conversationService.getConversation(conversationId);
       console.log(chalk.bold('\nSession status:'));
-      console.log(`  Provider:  ${providerId}`);
-      console.log(`  Model:     ${modelId}`);
-      console.log(`  Directory: ${state.currentProjectPath || cwd}`);
+      console.log(`  Provider:  ${sanitizeTerminalText(providerId)}`);
+      console.log(`  Model:     ${sanitizeTerminalText(modelId)}`);
+      console.log(`  Directory: ${sanitizeTerminalText(state.currentProjectPath || cwd)}`);
       console.log(`  Tokens:    ${sessionUsage.totalTokens} total`);
       console.log(`  Messages:  ${conv?.messageCount || 0}`);
-      console.log(`  Goal:      ${sessionGoal || '(none)'}`);
+      console.log(`  Goal:      ${sanitizeTerminalText(sessionGoal || '(none)')}`);
       console.log(`  Focus:     ${sessionFocusMode ? 'ON' : 'OFF'}`);
       console.log(`  Plan mode: ${sessionPlanMode ? 'ON' : 'OFF'}`);
       if (sessionMemory.length) console.log(`  Memory:    ${sessionMemory.length} note(s)`);

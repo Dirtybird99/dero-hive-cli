@@ -7,14 +7,17 @@ import { getDb, getSetting } from '../../../src/main/db/client.js';
 import { getAdapter, listProviders } from '../../../src/main/providers/registry.js';
 import type { ProviderStreamEvent } from '../../../src/main/providers/base.js';
 import { ToolRegistry } from '../../../src/main/tools/registry.js';
-import { getDefaultWorkspace } from '../../../src/main/utils/paths.js';
 import { truncateMessagesForContext } from '../../../src/main/utils/tokenBudget.js';
 import { hydrateAttachmentRefs, validateAttachmentRefs } from '../../../src/main/utils/attachments.js';
 import { logger } from '../../../src/main/utils/logger.js';
+import { canonicalWorkspacePath } from '../../../src/shared/workspace.js';
 import * as conversationService from './conversation.js';
 
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS_TOTAL_BYTES = 25 * 1024 * 1024;
+const TITLE_TIMEOUT_MS = 20_000;
+const DEFAULT_TITLES = new Set(['', 'New chat', 'New conversation']);
+const titleJobs = new Map<string, { controller: AbortController; promise: Promise<void> }>();
 const PLAN_SAFE_TOOL_NAMES = new Set([
   'read_file',
   'list_directory',
@@ -219,6 +222,25 @@ export async function runChat(
   const messageId = randomUUID();
   const userMsg = req.messages[req.messages.length - 1];
 
+  const conversation = conversationService.getConversation(req.conversationId);
+  let cwd: string;
+  let scopeError: string | undefined;
+  try {
+    if (!conversation) throw new Error(`Conversation ${req.conversationId} does not exist.`);
+    if (!conversation.workspacePath) throw new Error('Conversation has no workspace scope. Start a new conversation in this workspace.');
+    const storedWorkspace = canonicalWorkspacePath(conversation.workspacePath);
+    cwd = options.cwd ? canonicalWorkspacePath(options.cwd) : storedWorkspace;
+    if (cwd !== storedWorkspace) throw new Error('Conversation belongs to a different workspace. Start or resume a conversation for this directory.');
+  } catch (error) {
+    cwd = '';
+    scopeError = error instanceof Error ? error.message : String(error);
+  }
+  if (scopeError) {
+    onEvent({ type: 'error', conversationId: req.conversationId, messageId, error: scopeError });
+    onEvent({ type: 'done', conversationId: req.conversationId, messageId });
+    return { messageId };
+  }
+
   const appSettings = getSetting<Partial<Record<string, unknown>>>('appSettings');
   const resolution = resolveProviderChain(
     { providerId: req.providerId, model: req.model },
@@ -261,22 +283,13 @@ export async function runChat(
     }
   }
 
-  const conv = getDb()
-    .prepare('SELECT project_id, system_prompt FROM conversations WHERE id = ?')
-    .get(req.conversationId) as { project_id?: string; system_prompt?: string } | undefined;
-  let projectPath: string | undefined;
-  if (conv?.project_id) {
-    const proj = getDb().prepare('SELECT path FROM projects WHERE id = ?').get(conv.project_id) as { path?: string } | undefined;
-    projectPath = proj?.path;
-  }
-  const cwd = options.cwd || projectPath || getSetting<string>('workingDirectory') || getDefaultWorkspace();
-  if (projectPath) logger.info('chat', `using project cwd: ${projectPath}`);
+  logger.info('chat', `using conversation workspace: ${cwd}`);
 
   const requestSystemPrompt = req.systemPrompt?.trim();
   const baseSystemPrompt = requestSystemPrompt || getSetting<string>('defaultSystemPrompt', '') || TERMINAL_SYSTEM_PROMPT;
   const agentPrompt = req.agentPrompt?.trim();
   const withAgent = agentPrompt ? `${baseSystemPrompt}\n\n${agentPrompt}` : baseSystemPrompt;
-  const convSystemPrompt = requestSystemPrompt ? undefined : conv?.system_prompt?.trim();
+  const convSystemPrompt = requestSystemPrompt ? undefined : conversation?.systemPrompt?.trim();
   const withConv = convSystemPrompt ? `${withAgent}\n\n${convSystemPrompt}` : withAgent;
   const systemPrompt = `${withConv}\n\nThe active terminal workspace is: ${cwd}\nTreat this directory as the working context for file operations, shell commands, and code-related tasks.\n\n${buildProjectSnapshot(cwd)}`;
 
@@ -303,7 +316,7 @@ export async function runChat(
   const primaryContextWindow = activeTargets[0]?.modelDef.contextWindow || 128_000;
   const context = conversationService.estimateContext(req.conversationId);
   if (context.messages > 8 && context.estimatedTokens / Math.max(1, primaryContextWindow - 4096) >= 0.85) {
-    const compacted = conversationService.compactConversation(req.conversationId);
+    const compacted = await conversationService.compactConversation(req.conversationId);
     if (compacted.removedCount > 0) {
       currentMessages = conversationService.getMessages(req.conversationId);
       options.onCompaction?.(compacted);
@@ -325,9 +338,11 @@ export async function runChat(
   let lastToolSignature = '';
   let toolSignatureStreak = 0;
   let forceFinalize = false;
+  let lastMessageId = messageId;
 
   for (let round = 0; round <= maxAgenticRounds; round++) {
     const turnId = round === 0 ? messageId : randomUUID();
+    lastMessageId = turnId;
     if (round > 0) onEvent({ type: 'start', conversationId: req.conversationId, messageId: turnId });
 
     // One final tool-free pass turns gathered results into a useful answer
@@ -375,7 +390,11 @@ export async function runChat(
               : async (permission) => {
                   sideEffectOccurred = true;
                   fallbackAllowed = false;
-                  return tools.requestPermission(permission, { cwd, conversationId: req.conversationId });
+                  return tools.requestPermission(permission, {
+                    cwd,
+                    conversationId: req.conversationId,
+                    signal: options.signal
+                  });
                 }
           }),
         options.signal || new AbortController().signal,
@@ -426,12 +445,12 @@ export async function runChat(
     } catch (error) {
       if (options.signal?.aborted) {
         onEvent({ type: 'done', conversationId: req.conversationId, messageId: turnId });
-        return { messageId };
+        return { messageId: turnId };
       }
       const errorMessage = error instanceof Error ? error.message : String(error);
       onEvent({ type: 'error', conversationId: req.conversationId, messageId: turnId, error: errorMessage });
       onEvent({ type: 'done', conversationId: req.conversationId, messageId: turnId });
-      return { messageId };
+      return { messageId: turnId };
     }
 
     activeTargets = [selectedTarget];
@@ -479,24 +498,51 @@ export async function runChat(
     conversationService.updateConversationTokens(req.conversationId, roundUsage.totalTokens);
 
     if (options.signal?.aborted) {
+      for (const tc of validToolCalls) {
+        conversationService.persistMessage(req.conversationId, {
+          id: randomUUID(),
+          role: 'tool',
+          toolCallId: tc.id,
+          name: tc.name,
+          content: '[cancelled] Tool call was not started because the operation was cancelled.',
+          createdAt: Date.now()
+        });
+      }
       onEvent({ type: 'done', conversationId: req.conversationId, messageId: turnId });
-      return { messageId };
+      return { messageId: turnId };
     }
 
     if (finalizing || validToolCalls.length === 0) {
       onEvent({ type: 'done', conversationId: req.conversationId, messageId: turnId });
       if (appSettings?.autoTitle !== false) {
-        void maybeGenerateTitle(req.conversationId, selectedTarget.providerId, selectedTarget.model);
+        scheduleTitle(req.conversationId, selectedTarget.providerId, selectedTarget.model);
       }
-      return { messageId };
+      return { messageId: turnId };
     }
 
     const toolResults: Message[] = [];
-    for (const tc of validToolCalls) {
+    for (let index = 0; index < validToolCalls.length; index++) {
+      const tc = validToolCalls[index];
+      // Providers may return several calls in one batch. Once the user cancels,
+      // do not start any later call from that already-buffered batch, but retain
+      // protocol-complete synthetic results so strict providers can resume it.
+      if (options.signal?.aborted) {
+        for (const skipped of validToolCalls.slice(index)) {
+          toolResults.push({
+            id: randomUUID(),
+            role: 'tool',
+            toolCallId: skipped.id,
+            name: skipped.name,
+            content: '[cancelled] Tool call was not started because the operation was cancelled.',
+            createdAt: Date.now()
+          });
+        }
+        break;
+      }
       let args: Record<string, unknown> = {};
       try { args = JSON.parse(tc.arguments); } catch { /* leave empty */ }
       options.onToolStart?.({ toolCallId: tc.id, toolName: tc.name, args });
-      const ctx = { cwd, conversationId: req.conversationId };
+      const ctx = { cwd, conversationId: req.conversationId, signal: options.signal };
       const start = Date.now();
       const result = await tools.execute(tc.name, args, ctx);
       const durationMs = Date.now() - start;
@@ -519,20 +565,43 @@ export async function runChat(
 
     for (const tr of toolResults) conversationService.persistMessage(req.conversationId, tr);
     currentMessages = [...currentMessages, assistantMsg, ...toolResults];
+    if (options.signal?.aborted) {
+      onEvent({ type: 'done', conversationId: req.conversationId, messageId: turnId });
+      return { messageId: turnId };
+    }
   }
 
   const limitMessage = `Agent stopped after ${maxAgenticRounds} tool round${maxAgenticRounds === 1 ? '' : 's'}.`;
   onEvent({ type: 'error', conversationId: req.conversationId, messageId, error: limitMessage });
   onEvent({ type: 'done', conversationId: req.conversationId, messageId });
-  return { messageId };
+  return { messageId: lastMessageId };
 }
 
-async function maybeGenerateTitle(conversationId: string, providerId: string, model: string): Promise<void> {
+function scheduleTitle(conversationId: string, providerId: string, model: string): void {
+  if (titleJobs.has(conversationId)) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TITLE_TIMEOUT_MS);
+  timer.unref?.();
+  const promise = maybeGenerateTitle(conversationId, providerId, model, controller.signal)
+    .finally(() => {
+      clearTimeout(timer);
+      titleJobs.delete(conversationId);
+    });
+  titleJobs.set(conversationId, { controller, promise });
+}
+
+/** Cancel and drain background title work before providers and SQLite close. */
+export async function shutdownChatTasks(): Promise<void> {
+  const jobs = [...titleJobs.values()];
+  for (const job of jobs) job.controller.abort();
+  await Promise.allSettled(jobs.map((job) => job.promise));
+}
+
+async function maybeGenerateTitle(conversationId: string, providerId: string, model: string, signal: AbortSignal): Promise<void> {
   try {
     const conv = getDb().prepare('SELECT title FROM conversations WHERE id = ?').get(conversationId) as { title: string } | undefined;
     if (!conv) return;
-    const isDefault = !conv.title || conv.title === 'New chat' || conv.title === 'New conversation';
-    if (!isDefault) return;
+    if (!DEFAULT_TITLES.has(conv.title || '')) return;
 
     const rows = getDb()
       .prepare('SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY sort_order ASC')
@@ -543,25 +612,35 @@ async function maybeGenerateTitle(conversationId: string, providerId: string, mo
 
     const adapter = getAdapter(providerId);
     if (!adapter) return;
+    const titleConversationId = `title:${conversationId}:${randomUUID()}`;
     let title = '';
-    for await (const evt of adapter.stream({
-      conversationId,
-      model,
-      messages: [
-        { id: randomUUID(), role: 'user', content: userRow.content, createdAt: Date.now() },
-        { id: randomUUID(), role: 'assistant', content: assistantRow.content, createdAt: Date.now() }
-      ],
-      systemPrompt: 'Create a concise title (3-6 words) for this conversation. Reply with only the title, no quotes or extra text.',
-      maxTokens: 20,
-      temperature: 0.3
-    })) {
-      if (evt.type === 'delta' && evt.content) title += evt.content;
-      if (evt.type === 'error') break;
+    try {
+      for await (const evt of adapter.stream({
+        conversationId: titleConversationId,
+        model,
+        messages: [
+          { id: randomUUID(), role: 'user', content: userRow.content, createdAt: Date.now() },
+          { id: randomUUID(), role: 'assistant', content: assistantRow.content, createdAt: Date.now() }
+        ],
+        systemPrompt: 'Create a concise title (3-6 words) for this conversation. Reply with only the title, no quotes or extra text.',
+        maxTokens: 20,
+        temperature: 0.3,
+        signal
+      })) {
+        if (evt.type === 'delta' && evt.content) title += evt.content;
+        if (evt.type === 'error') break;
+      }
+    } finally {
+      try { await adapter.closeConversation?.(titleConversationId); } catch { /* best effort */ }
     }
     title = title.trim().replace(/^["']|["']$/g, '').replace(/\.$/, '').slice(0, 60);
     if (!title) return;
-    getDb().prepare('UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?').run(title, Date.now(), conversationId);
+    // A user rename that happened while the provider was streaming always wins.
+    getDb().prepare(`
+      UPDATE conversations SET title = ?, updated_at = ?
+      WHERE id = ? AND (title IS NULL OR title = '' OR title IN ('New chat', 'New conversation'))
+    `).run(title, Date.now(), conversationId);
   } catch (err) {
-    logger.warn('chat', 'title generation failed', err);
+    if (!signal.aborted) logger.warn('chat', 'title generation failed', err);
   }
 }

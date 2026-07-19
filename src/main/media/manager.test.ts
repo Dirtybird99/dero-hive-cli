@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { MediaJobStatusEvent, MediaProviderConfig } from '../../shared/types.js';
+import type { MediaArtifactRecord, MediaJobStatusEvent, MediaProviderConfig } from '../../shared/types.js';
 
 // MediaManager tests: provider CRUD + secrets, generation lifecycle (queued →
 // succeeded/failed events, artifact rows, files on disk), cancellation
@@ -19,6 +19,8 @@ const payloadB64 = payload.toString('base64');
 
 // When set, the /slow route holds its response until the gate resolves.
 let gate: Promise<void> | null = null;
+let slowStarted = false;
+let slowClosed = false;
 
 const server = createServer((req, res) => {
   const url = new URL(req.url || '/', 'http://127.0.0.1');
@@ -29,6 +31,8 @@ const server = createServer((req, res) => {
     res.end(body);
   };
   if (path === '/slow/sd-api/v1/txt2img') {
+    slowStarted = true;
+    res.once('close', () => { if (!res.writableEnded) slowClosed = true; });
     void (gate ?? Promise.resolve()).then(() => finish(200, JSON.stringify({ images: [payloadB64], info: '{}' })));
     return;
   }
@@ -190,20 +194,27 @@ try {
   let release!: () => void;
   gate = new Promise<void>((resolve) => { release = resolve; });
   const pending = manager.generate({ prompt: 'slow job' }, { jobId: 'job-cancel' });
-  while (!events.some((e) => e.job.id === 'job-cancel')) {
+  while (!slowStarted) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  const cancelStartedAt = Date.now();
   assert.equal(manager.cancel('job-cancel'), true, 'in-flight jobs must be cancellable');
   const cancelledRow = manager.listArtifacts().find((a) => a.id === 'job-cancel');
   assert.equal(cancelledRow?.status, 'cancelled');
   assert.equal(cancelledRow?.error, 'Cancelled by user');
-  release();
-  gate = null;
-  // Fixed: the AbortController still isn't wired into adapter fetches, so the
-  // in-flight job runs to completion — but a cancelled row is never overwritten
-  // with 'succeeded', no artifact is recorded (the orphaned file is deleted),
-  // and no success event is emitted.
-  const cancelledResult = await pending;
+  let cancelledResult: MediaArtifactRecord;
+  try {
+    cancelledResult = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('cancelled media request did not settle')), 2_000))
+    ]);
+    assert.ok(Date.now() - cancelStartedAt < 1_000, 'cancel must abort the provider request promptly');
+    for (let i = 0; i < 100 && !slowClosed; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(slowClosed, true, 'cancel must close the in-flight provider socket');
+  } finally {
+    release();
+    gate = null;
+  }
   assert.equal(cancelledResult.status, 'cancelled');
   const settledRow = manager.listArtifacts().find((a) => a.id === 'job-cancel');
   assert.equal(settledRow?.status, 'cancelled', 'completion must not overwrite a cancelled row');
@@ -216,12 +227,55 @@ try {
   assert.equal(readdirSync(monthDir).length, filesBeforeCancelJob, 'cancelled job must not leave its artifact file behind');
   assert.equal(manager.cancel('job-cancel'), false, 'bookkeeping must be cleared once the job settles');
 
+  manager.saveProvider({ ...a1111Row });
+  const callerAbort = new AbortController();
+  callerAbort.abort();
+  const callerCancelled = await manager.generate(
+    { prompt: 'caller cancelled' },
+    { jobId: 'job-caller-cancel', signal: callerAbort.signal }
+  );
+  assert.equal(callerCancelled.status, 'cancelled', 'a caller AbortSignal must reach the adapter and job record');
+  assert.equal(manager.listArtifacts().find((item) => item.id === 'job-caller-cancel')?.status, 'cancelled');
+  assert.equal(readdirSync(monthDir).some((name) => name.includes('partial-')), false, 'cancelled writes must leave no partial files');
+
+  // An adapter that ignores AbortSignal and resolves late must still never
+  // turn an externally-cancelled job into a successful artifact.
+  let ignoringStarted!: () => void;
+  const ignoringReady = new Promise<void>((resolve) => { ignoringStarted = resolve; });
+  let releaseIgnoring!: () => void;
+  const ignoringGate = new Promise<void>((resolve) => { releaseIgnoring = resolve; });
+  const ignoringEvents: MediaJobStatusEvent[] = [];
+  const ignoringManager = new MediaManager((event) => ignoringEvents.push(event), (_cfg, _apiKey, kind) => ({
+    id: 'ignores-abort',
+    kind,
+    async test() { return { ok: true }; },
+    async generate(_request, context) {
+      ignoringStarted();
+      await ignoringGate;
+      const absolutePath = join(context.outputDir, 'ignored-abort.png');
+      writeFileSync(absolutePath, payload);
+      return { absolutePath, relativePath: 'ignored-abort.png', mimeType: 'image/png', bytes: payload.length };
+    }
+  }));
+  const ignoredAbort = new AbortController();
+  const ignoredPending = ignoringManager.generate(
+    { prompt: 'adapter ignores cancellation' },
+    { jobId: 'job-ignored-abort', signal: ignoredAbort.signal }
+  );
+  await ignoringReady;
+  ignoredAbort.abort();
+  releaseIgnoring();
+  const ignoredResult = await ignoredPending;
+  assert.equal(ignoredResult.status, 'cancelled');
+  assert.equal(ignoringManager.listArtifacts().find((item) => item.id === 'job-ignored-abort')?.status, 'cancelled');
+  assert.equal(existsSync(join(monthDir, 'ignored-abort.png')), false, 'late output from an abort-ignoring adapter is deleted');
+  assert.equal(ignoringEvents.some((event) => event.job.status === 'succeeded'), false, 'external cancellation emits no success');
+
   // ── Project-scoped generation ─────────────────────────────────────────────
   const projectDir = join(dataDir, 'project');
   mkdirSync(projectDir, { recursive: true });
   getDb().prepare('INSERT INTO projects (id, name, path, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run('proj1', 'Proj', projectDir, '{}', Date.now(), Date.now());
-  manager.saveProvider({ ...a1111Row }); // restore the working base URL
   const projRec = await manager.generate({ prompt: 'p', projectId: 'proj1' });
   assert.equal(projRec.projectId, 'proj1');
   const projAbs = join(projectDir, projRec.relativePath);
@@ -229,14 +283,47 @@ try {
   const projArts = manager.listArtifacts('proj1');
   assert.equal(projArts.length, 1);
   assert.equal(manager.absolutePathFor(projArts[0]), projAbs);
+  const copiedProjectArtifact = await manager.copyArtifactToProject(projRec.id, projectDir, 'hive');
+  assert.equal(copiedProjectArtifact.ok, true, 'project-scoped artifacts must remain copyable');
+  assert.ok(copiedProjectArtifact.path);
+  assert.deepEqual(readFileSync(copiedProjectArtifact.path), payload);
+
+  // Shutdown aborts and drains active jobs so provider sockets and artifact
+  // writes cannot outlive the database that owns their records.
+  manager.saveProvider({ ...a1111Row, baseUrl: `${base}/slow` });
+  gate = new Promise<void>((resolve) => { release = resolve; });
+  slowStarted = false;
+  slowClosed = false;
+  const shutdownJob = manager.generate({ prompt: 'shutdown job' }, { jobId: 'job-shutdown' });
+  while (!slowStarted) await new Promise((resolve) => setTimeout(resolve, 10));
+  try {
+    await Promise.race([
+      manager.shutdown(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('media shutdown did not drain')), 2_000))
+    ]);
+    assert.equal((await shutdownJob).status, 'cancelled');
+    for (let i = 0; i < 100 && !slowClosed; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(slowClosed, true, 'shutdown must close active provider sockets');
+  } finally {
+    release();
+    gate = null;
+  }
+  await assert.rejects(manager.generate({ prompt: 'after shutdown' }), /shutting down/u);
 
   // ── Artifact deletion ─────────────────────────────────────────────────────
-  assert.deepEqual(manager.deleteArtifact(rec.id), { ok: true });
+  const refusingDelete = new MediaManager(undefined, undefined, async () => {
+    throw Object.assign(new Error('fixture access denied'), { code: 'EACCES' });
+  });
+  assert.deepEqual(await refusingDelete.deleteArtifact(rec.id), {
+    ok: false,
+    error: 'Artifact file could not be removed: fixture access denied'
+  });
+  assert.ok(manager.listArtifacts().some((artifact) => artifact.id === rec.id), 'failed file removal retains artifact metadata');
+  assert.equal(existsSync(absPath), true);
+
+  assert.deepEqual(await manager.deleteArtifact(rec.id), { ok: true });
   assert.ok(!manager.listArtifacts().some((a) => a.id === rec.id));
-  assert.deepEqual(manager.deleteArtifact(rec.id), { ok: false, error: 'Artifact not found' });
-  for (let i = 0; i < 100 && existsSync(absPath); i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  assert.deepEqual(await manager.deleteArtifact(rec.id), { ok: false, error: 'Artifact not found' });
   assert.equal(existsSync(absPath), false, 'deleting an artifact must remove its file');
 
   // ── Legacy path repair: bare-id orphan renamed to <id>.<ext> ──────────────

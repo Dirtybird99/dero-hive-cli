@@ -1,13 +1,27 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import type { ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BUILTIN_TOOLS, builtinExecutors, htmlToText, isBlockedUrl, isBlockedAddress, parseDuckDuckGoHtml, __setHostResolverForTest } from './builtin.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import {
+  BUILTIN_TOOLS,
+  builtinExecutors,
+  htmlToText,
+  isBlockedUrl,
+  isBlockedAddress,
+  parseDuckDuckGoHtml,
+  __setHostResolverForTest,
+  __setShellProcessHooksForTest,
+  __setWebFetchTimeoutForTest
+} from './builtin.js';
 import { setMediaManager } from '../media/instance.js';
 import { setSimulatorManager } from '../simulator/instance.js';
 import { setXswdManager } from '../xswd/instance.js';
 
 const root = mkdtempSync(join(tmpdir(), 'dero-hive-tools-'));
+const outside = mkdtempSync(join(tmpdir(), 'dero-hive-tools-outside-'));
 const ctx = { cwd: root, conversationId: 'tool-test' };
 const originalFetch = globalThis.fetch;
 
@@ -32,12 +46,37 @@ try {
   assert.match((await builtinExecutors.list_directory({ path: 'src' }, ctx)).content, /example\.txt/u);
   assert.match((await builtinExecutors.glob_files({ pattern: '**/*.txt' }, ctx)).content, /src[\\/]example\.txt/u);
   assert.match((await builtinExecutors.grep_files({ pattern: 'gamma', include: '**/*.txt' }, ctx)).content, /example\.txt:2:gamma/u);
+  const unsafeGrep = await builtinExecutors.grep_files({ pattern: '(a+)+$', include: '**/*.txt' }, ctx);
+  assert.equal(unsafeGrep.isError, true);
+  assert.match(unsafeGrep.content, /potentially unsafe/u);
+  writeFileSync(join(root, 'ambiguous-regex.txt'), `${'a'.repeat(100_000)}!\n`);
+  const regexAbort = new AbortController();
+  setTimeout(() => regexAbort.abort(), 50);
+  const regexStartedAt = Date.now();
+  const cancelledGrep = await builtinExecutors.grep_files(
+    { pattern: '^(a|aa)+$', include: 'ambiguous-regex.txt' },
+    { ...ctx, signal: regexAbort.signal }
+  );
+  assert.equal(cancelledGrep.isError, true);
+  assert.match(cancelledGrep.content, /cancelled/u);
+  assert.ok(Date.now() - regexStartedAt < 2_000, 'catastrophic regex evaluation is isolated and promptly cancellable');
+  writeFileSync(join(outside, 'private.txt'), 'AUDIT_SECRET_MARKER');
+  symlinkSync(outside, join(root, 'linked-outside'), process.platform === 'win32' ? 'junction' : 'dir');
+  const escapedGrep = await builtinExecutors.grep_files({ pattern: 'AUDIT_SECRET_MARKER', include: '**/*.txt' }, ctx);
+  assert.doesNotMatch(escapedGrep.content, /AUDIT_SECRET_MARKER/u, 'grep must not follow a workspace link outside its root');
+  const escapedGlob = await builtinExecutors.glob_files({ pattern: '**/*.txt' }, ctx);
+  assert.doesNotMatch(escapedGlob.content, /linked-outside/u, 'glob must not enumerate through a workspace link');
   await assert.rejects(() => builtinExecutors.read_file({ path: '../outside.txt' }, ctx), /outside allowed workspace/u);
 
   // read_file: missing target reports an error result rather than throwing.
   const missingRead = await builtinExecutors.read_file({ path: 'does-not-exist.txt' }, ctx);
   assert.equal(missingRead.isError, true);
   assert.match(missingRead.content, /file not found/u);
+  writeFileSync(join(root, 'oversized.bin'), Buffer.alloc(10 * 1024 * 1024 + 1));
+  assert.equal((await builtinExecutors.read_file({ path: 'oversized.bin' }, ctx)).isError, true);
+  assert.equal((await builtinExecutors.read_file({ path: 'oversized.bin', encoding: 'base64' }, ctx)).isError, true);
+  assert.equal((await builtinExecutors.write_file({ path: 'too-large.txt', content: 'x'.repeat(5 * 1024 * 1024 + 1) }, ctx)).isError, true);
+  assert.equal(existsSync(join(root, 'too-large.txt')), false);
 
   // edit_file: a non-unique old_text is rejected (must match exactly once).
   await builtinExecutors.write_file({ path: 'dup.txt', content: 'dup\ndup\n' }, ctx);
@@ -60,12 +99,7 @@ try {
   // timeout_ms (pinned down here) and the optional ctx.signal AbortSignal
   // (pinned down in the cancellation section below).
 
-  // timeout_ms terminates a long-running process promptly. The shell itself is
-  // the sleeper (Start-Sleep / sleep are shell-level), so the killed process is
-  // exactly the one exec spawned and nothing is orphaned. The tool must settle
-  // far sooner than the 10s sleep and report the kill (exit code null -> 'err')
-  // as an error result. If the child were not reaped, this test file itself
-  // would hang past the sleep instead of exiting promptly.
+  // timeout_ms terminates a long-running process promptly and reports an error.
   const sleepCommand = process.platform === 'win32' ? 'Start-Sleep -Seconds 10' : 'sleep 10';
   const timeoutStart = Date.now();
   const timedOut = await builtinExecutors.run_shell({ command: sleepCommand, timeout_ms: 1_000 }, ctx);
@@ -92,12 +126,8 @@ try {
   assert.ok(Date.now() - preStart < 2_000, 'pre-aborted run_shell must settle without running the command');
   assert.equal(existsSync(join(root, 'abort-marker.txt')), false);
 
-  // Abort mid-run: exec kills the child promptly and the tool reports a
-  // cancellation result long before the 10s sleep would finish. On win32 the
-  // shell itself sleeps (same orphan-avoidance reasoning as the timeout test
-  // above) so the killed pid is exactly the one exec spawned; on POSIX
-  // /bin/sh execs the single node command, so the kill reaps node itself.
-  // If the child were not reaped, this test file would hang past the sleep.
+  // Abort mid-run: the shell tree is killed promptly and cancellation is
+  // reported long before the 10s sleep would finish.
   const cancelSleepCommand = process.platform === 'win32'
     ? 'Start-Sleep -Seconds 10'
     : 'node -e "setTimeout(()=>{},10000)"';
@@ -153,6 +183,11 @@ try {
   // an error result (ERR_INVALID_ARG_TYPE), not a thrown exception.
   const noCommand = await builtinExecutors.run_shell({}, ctx);
   assert.equal(noCommand.isError, true);
+  for (const timeout_ms of [-1, 0, 99, 300_001, 1.5, Number.NaN]) {
+    const invalidTimeout = await builtinExecutors.run_shell({ command: 'exit 0', timeout_ms }, ctx);
+    assert.equal(invalidTimeout.isError, true);
+    assert.match(invalidTimeout.content, /timeout_ms/u);
+  }
   assert.match(noCommand.content, /must be of type string/u);
 
   // A cwd escaping the workspace is rejected by path policy before any spawn.
@@ -164,7 +199,127 @@ try {
   assert.equal(bigOut.content.length, 50_000);
   assert.equal((await builtinExecutors.run_shell({ command: 'node -e "0"' }, ctx)).content, '(no output)');
 
+  // Timeout, abort, and output overflow must kill descendants as well as the
+  // shell. The grandchild announces that it started, then writes a marker only
+  // if it survives long enough to escape the tool call.
+  const treeChild = 'tree-grandchild.cjs';
+  const treeParent = 'tree-parent.cjs';
+  writeFileSync(join(root, treeChild), `
+const fs = require('node:fs');
+fs.writeFileSync(process.argv[2], 'ready');
+setTimeout(() => fs.writeFileSync(process.argv[3], 'escaped'), 2000);
+setInterval(() => {}, 1000);
+`);
+  writeFileSync(join(root, treeParent), `
+const { spawn } = require('node:child_process');
+spawn(process.execPath, [${JSON.stringify(join(root, treeChild))}, process.argv[2], process.argv[3]], { stdio: 'ignore' });
+if (process.argv[4] === 'spam') {
+  setTimeout(() => {
+    const chunk = 'x'.repeat(65536);
+    const write = () => { while (process.stdout.write(chunk)) {} };
+    process.stdout.on('drain', write);
+    write();
+  }, 200);
+}
+setInterval(() => {}, 1000);
+`);
+
+  const assertTreeStopped = async (
+    name: string,
+    run: (ready: string, marker: string) => Promise<{ content: string; isError?: boolean }>
+  ): Promise<void> => {
+    const ready = `tree-${name}-ready.txt`;
+    const marker = `tree-${name}-marker.txt`;
+    const treeResult = await run(ready, marker);
+    assert.equal(treeResult.isError, true, `${name} should stop the command`);
+    assert.ok(treeResult.content.length <= 50_000, `${name} output remains bounded`);
+    // Leave enough time for output overflow to be observed through PowerShell
+    // on a loaded Windows runner before testing whether the child escaped.
+    await delay(2200);
+    assert.equal(existsSync(join(root, ready)), true, `${name} fixture grandchild started`);
+    assert.equal(existsSync(join(root, marker)), false, `${name} must kill the grandchild`);
+  };
+
+  await assertTreeStopped('timeout', (ready, marker) => builtinExecutors.run_shell(
+    { command: `node ${treeParent} ${ready} ${marker}`, timeout_ms: 300 },
+    ctx
+  ));
+  await assertTreeStopped('abort', async (ready, marker) => {
+    const controller = new AbortController();
+    const poll = setInterval(() => {
+      if (existsSync(join(root, ready))) controller.abort();
+    }, 10);
+    const fallback = setTimeout(() => controller.abort(), 2_000);
+    try {
+      return await builtinExecutors.run_shell(
+        { command: `node ${treeParent} ${ready} ${marker}` },
+        { ...ctx, signal: controller.signal }
+      );
+    } finally {
+      clearInterval(poll);
+      clearTimeout(fallback);
+    }
+  });
+  await assertTreeStopped('max-buffer', (ready, marker) => builtinExecutors.run_shell(
+    { command: `node ${treeParent} ${ready} ${marker} spam` },
+    ctx
+  ));
+
+  // A failed Windows taskkill is surfaced, and even a child that never emits
+  // close cannot leave the tool promise pending forever.
+  const fakeChild = (pid: number, kill: () => boolean = () => false): ChildProcess => Object.assign(new EventEmitter(), {
+    pid,
+    stdout: null,
+    stderr: null,
+    kill
+  }) as ChildProcess;
+  let fallbackKillAttempts = 0;
+  try {
+    __setShellProcessHooksForTest({
+      platform: 'win32',
+      closeGraceMs: 25,
+      taskkillTimeoutMs: 25,
+      spawnShell: () => fakeChild(424_242, () => { fallbackKillAttempts++; return false; }),
+      spawnTaskkill: () => {
+        const killer = fakeChild(424_243);
+        queueMicrotask(() => killer.emit('close', 1, null));
+        return killer;
+      }
+    });
+    const failedTaskkillStart = Date.now();
+    const failedTaskkill = await builtinExecutors.run_shell({ command: 'ignored', timeout_ms: 100 }, ctx);
+    assert.equal(failedTaskkill.isError, true);
+    assert.match(failedTaskkill.content, /taskkill failed.*exit 1/iu);
+    assert.ok(fallbackKillAttempts > 0, 'failed taskkill attempts a direct-child fallback');
+    assert.ok(Date.now() - failedTaskkillStart < 1_000, 'failed taskkill settles within the bounded grace period');
+
+    __setShellProcessHooksForTest({
+      platform: 'win32',
+      closeGraceMs: 25,
+      taskkillTimeoutMs: 25,
+      spawnShell: () => fakeChild(424_244),
+      spawnTaskkill: () => {
+        const killer = fakeChild(424_245);
+        queueMicrotask(() => killer.emit('close', 0, null));
+        return killer;
+      }
+    });
+    const missingCloseStart = Date.now();
+    const missingClose = await builtinExecutors.run_shell({ command: 'ignored', timeout_ms: 100 }, ctx);
+    assert.equal(missingClose.isError, true);
+    assert.match(missingClose.content, /did not close within 25ms/iu);
+    assert.ok(Date.now() - missingCloseStart < 1_000, 'missing child close cannot hang run_shell');
+  } finally {
+    __setShellProcessHooksForTest(null);
+  }
+
   assert.match((await builtinExecutors.todo_write({ todos: [{ content: 'ship', status: 'completed' }] }, ctx)).content, /\[x\] ship/u);
+
+  process.env.HIVE_SIMULATOR_RPC_URL = 'https://example.com/json_rpc';
+  const unsafeSimulatorEndpoint = await builtinExecutors.get_simulator_chain_info({}, ctx);
+  assert.equal(unsafeSimulatorEndpoint.isError, true);
+  assert.match(unsafeSimulatorEndpoint.content, /numeric loopback/u);
+  delete process.env.HIVE_SIMULATOR_RPC_URL;
 
   const contract = 'Function Initialize() Uint64\n10 STORE("owner", SIGNER())\n20 RETURN 0\nEnd Function';
   assert.match((await builtinExecutors.lint_dvm_basic({ source: contract }, ctx)).content, /function/u);
@@ -205,6 +360,11 @@ try {
     network: 'simulator', height: 12, topoheight: 11, tx_pool_size: 0, status: 'OK', version: 'test'
   } }), { status: 200, headers: { 'content-type': 'application/json' } });
   assert.match((await builtinExecutors.get_simulator_chain_info({}, ctx)).content, /simulator/u);
+
+  globalThis.fetch = async () => new Response(JSON.stringify({ result: { padding: 'x'.repeat(1024 * 1024) } }), { status: 200 });
+  const oversizedInfo = await builtinExecutors.get_simulator_chain_info({}, ctx);
+  assert.equal(oversizedInfo.isError, true);
+  assert.match(oversizedInfo.content, /exceeds 1 MB/u);
 
   // get_simulator_chain_info: RPC error body, non-OK HTTP, and transport failure.
   globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'sim boom' } }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -410,7 +570,37 @@ try {
   // max_bytes truncates the returned body.
   globalThis.fetch = async () => new Response('x'.repeat(500), { status: 200, headers: { 'content-type': 'text/plain' } });
   const fetchTrunc = await builtinExecutors.web_fetch({ url: 'https://example.com/big', max_bytes: 100 }, ctx);
-  assert.match(fetchTrunc.content, /truncated at 100 chars/u);
+  assert.match(fetchTrunc.content, /truncated at 100 bytes/u);
+
+  // Cancellation stays active after headers arrive and while the body stalls.
+  globalThis.fetch = async (_url, init) => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      (init?.signal as AbortSignal | undefined)?.addEventListener('abort', () => {
+        controller.error(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    }
+  }), { status: 200, headers: { 'content-type': 'text/plain' } });
+  const bodyAbort = new AbortController();
+  const stalledBody = builtinExecutors.web_fetch(
+    { url: 'https://example.com/stall' },
+    { ...ctx, signal: bodyAbort.signal }
+  );
+  setTimeout(() => bodyAbort.abort(), 25);
+  const cancelledBody = await stalledBody;
+  assert.equal(cancelledBody.isError, true);
+  assert.match(cancelledBody.content, /cancelled/u);
+
+  // An endless response is read incrementally and cancelled as soon as the
+  // byte limit is known to be exceeded; the full stream is never buffered.
+  let bodyCancelled = false;
+  globalThis.fetch = async () => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) { controller.enqueue(new Uint8Array(64).fill(120)); },
+    cancel() { bodyCancelled = true; }
+  }), { status: 200, headers: { 'content-type': 'text/plain' } });
+  const cappedBody = await builtinExecutors.web_fetch({ url: 'https://example.com/endless', max_bytes: 100 }, ctx);
+  assert.match(cappedBody.content, /truncated at 100 bytes/u);
+  assert.equal(cappedBody.meta?.bytes, 100);
+  assert.equal(bodyCancelled, true);
 
   // ---- web_search executor (keyless DuckDuckGo fallback) ----
   delete process.env.HIVE_SEARCH_API_KEY;
@@ -419,6 +609,35 @@ try {
   assert.equal(searchOk.isError, undefined);
   assert.match(searchOk.content, /example\.com\/a/u);
   assert.equal((searchOk.meta?.results as unknown[])?.length, 2);
+
+  // Search responses are capped while streaming instead of being handed to
+  // unbounded Response.text()/json() helpers.
+  let oversizedSearchCancelled = false;
+  globalThis.fetch = async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new Uint8Array(1_000_001).fill(120)); },
+    cancel() { oversizedSearchCancelled = true; }
+  }), { status: 200, headers: { 'content-type': 'text/html' } });
+  const oversizedSearch = await builtinExecutors.web_search({ query: 'oversized' }, ctx);
+  assert.equal(oversizedSearch.isError, true);
+  assert.match(oversizedSearch.content, /response exceeded 1000000 bytes/iu);
+  assert.equal(oversizedSearchCancelled, true);
+
+  // The request deadline remains armed after headers and aborts a stalled body.
+  let stalledSearchCancelled = false;
+  __setWebFetchTimeoutForTest(30);
+  try {
+    globalThis.fetch = async () => new Response(new ReadableStream<Uint8Array>({
+      cancel() { stalledSearchCancelled = true; }
+    }), { status: 200, headers: { 'content-type': 'text/html' } });
+    const stalledSearchStart = Date.now();
+    const timedOutSearch = await builtinExecutors.web_search({ query: 'stalled' }, ctx);
+    assert.equal(timedOutSearch.isError, true);
+    assert.match(timedOutSearch.content, /timed out after 30ms/iu);
+    assert.equal(stalledSearchCancelled, true);
+    assert.ok(Date.now() - stalledSearchStart < 1_000, 'stalled search body obeys the request deadline');
+  } finally {
+    __setWebFetchTimeoutForTest(null);
+  }
   // Missing query is rejected.
   assert.equal((await builtinExecutors.web_search({}, ctx)).isError, true);
 
@@ -433,9 +652,12 @@ try {
 } finally {
   globalThis.fetch = originalFetch;
   __setHostResolverForTest(null);
+  __setShellProcessHooksForTest(null);
+  __setWebFetchTimeoutForTest(null);
   setMediaManager(null);
   setSimulatorManager(null);
   setXswdManager(null);
   delete process.env.HIVE_CLI;
   rmSync(root, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
 }

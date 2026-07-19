@@ -9,18 +9,23 @@ import { getSecret, setSecret, deleteSecret } from '../utils/secrets';
 import type { MediaProviderConfig, MediaArtifactRecord, MediaJobRecord, MediaGenerationRequest, MediaJobStatusEvent, MediaProviderPreset, MediaModelOption, MediaKind } from '@shared/types';
 import { MEDIA_PROVIDER_PRESETS, findMediaPreset } from '@shared/media';
 import { adapterFor, type MediaAdapter } from './adapters';
+import { MAX_MEDIA_BYTES } from './http';
 import { getProviderApiKey, getProviderConfig } from '../providers/registry';
 
 export type MediaEventHandler = (evt: MediaJobStatusEvent) => void;
-
-const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024; // 50 MB hard cap per job
 
 export class MediaManager {
   private listeners = new Set<MediaEventHandler>();
   /** Cancellation flags keyed by job id. */
   private readonly cancellations = new Map<string, AbortController>();
+  private readonly activeJobs = new Map<string, Promise<MediaArtifactRecord>>();
+  private shuttingDown = false;
 
-  constructor(onEvent?: MediaEventHandler) {
+  constructor(
+    onEvent?: MediaEventHandler,
+    private readonly adapterResolver: typeof adapterFor = adapterFor,
+    private readonly unlinkFile: (path: string) => Promise<void> = unlink
+  ) {
     if (onEvent) this.listeners.add(onEvent);
   }
 
@@ -131,15 +136,17 @@ export class MediaManager {
     return rows.map(rowToArtifact);
   }
 
-  deleteArtifact(id: string): { ok: boolean; error?: string } {
+  async deleteArtifact(id: string): Promise<{ ok: boolean; error?: string }> {
     const row = getDb().prepare('SELECT * FROM media_artifacts WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!row) return { ok: false, error: 'Artifact not found' };
     const dirInfo = projectRootFor(row.project_id as string | null);
-    if (dirInfo) {
-      const abs = join(dirInfo, row.relative_path as string);
-      void unlink(abs).catch(() => undefined);
-    } else {
-      void unlink(join(paths.media, row.relative_path as string)).catch(() => undefined);
+    const absolute = join(dirInfo || paths.media, row.relative_path as string);
+    try {
+      await this.unlinkFile(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        return { ok: false, error: `Artifact file could not be removed: ${error instanceof Error ? error.message : String(error)}` };
+      }
     }
     getDb().prepare('DELETE FROM media_artifacts WHERE id = ?').run(id);
     return { ok: true };
@@ -243,7 +250,7 @@ export class MediaManager {
         customHeaders: mp.customHeaders,
         updatedAt: Date.now()
       };
-      const adapter = adapterFor(cfg, apiKey, kind);
+      const adapter = this.adapterResolver(cfg, apiKey, kind);
       if (!adapter) throw new Error(`No ${kind} adapter available for provider "${mp.name}".`);
       return { kind, model: req.model || '', adapter, cfg, apiKey, providerRefId: cfg.id };
     }
@@ -261,16 +268,30 @@ export class MediaManager {
       provider.defaultImageModel;
     const model = req.model || defaultModelForKind || preset?.defaultModel || '';
     const apiKey = getSecret(`media:${provider.id}`) || '';
-    const adapter = adapterFor(provider, apiKey, kind);
+    const adapter = this.adapterResolver(provider, apiKey, kind);
     if (!adapter) throw new Error(`No adapter for preset "${provider.presetId}" (${kind})`);
     return { kind, model, adapter, cfg: provider, apiKey, providerRefId: provider.id };
   }
 
-  async generate(req: MediaGenerationRequest, opts: { conversationId?: string; messageId?: string; jobId?: string } = {}): Promise<MediaArtifactRecord> {
+  generate(req: MediaGenerationRequest, opts: { conversationId?: string; messageId?: string; jobId?: string; signal?: AbortSignal } = {}): Promise<MediaArtifactRecord> {
+    if (this.shuttingDown) return Promise.reject(new Error('Media manager is shutting down'));
     const id = opts.jobId || randomUUID();
+    const job = this.generateJob(id, req, opts);
+    this.activeJobs.set(id, job);
+    return job.finally(() => { this.activeJobs.delete(id); });
+  }
+
+  private async generateJob(
+    id: string,
+    req: MediaGenerationRequest,
+    opts: { conversationId?: string; messageId?: string; jobId?: string; signal?: AbortSignal }
+  ): Promise<MediaArtifactRecord> {
     const { kind, model, adapter, cfg, apiKey, providerRefId } = this.resolveGeneration(req);
     const cancel = new AbortController();
     this.cancellations.set(id, cancel);
+    const onExternalAbort = (): void => cancel.abort(opts.signal?.reason);
+    if (opts.signal?.aborted) onExternalAbort();
+    else opts.signal?.addEventListener('abort', onExternalAbort, { once: true });
 
     // Project-scoped path: <project>/media/<yyyy-mm>/<jobId>.<ext>
     // Fallback: <userData>/media/<yyyy-mm>/<jobId>.<ext>
@@ -278,7 +299,6 @@ export class MediaManager {
     const baseDir = projectRootFor(projectId) || paths.media;
     const month = new Date().toISOString().slice(0, 7);
     const dir = join(baseDir, month);
-    if (!existsSync(dir)) await mkdir(dir, { recursive: true });
     const filenameHint = `${id}.bin`;
     const record: Partial<MediaJobRecord> = {
       id,
@@ -302,8 +322,15 @@ export class MediaManager {
       createdAt: Date.now(),
       startedAt: Date.now()
     };
-    insertArtifactRecord(record);
-    this.emit({ job: this.toPublic(record) });
+    try {
+      if (!existsSync(dir)) await mkdir(dir, { recursive: true });
+      insertArtifactRecord(record);
+      this.emit({ job: this.toPublic(record) });
+    } catch (error) {
+      opts.signal?.removeEventListener('abort', onExternalAbort);
+      this.cancellations.delete(id);
+      throw error;
+    }
 
     try {
       const mergedOptions = { ...(cfg.defaultOptions || {}), ...(req.options || {}) };
@@ -311,20 +338,23 @@ export class MediaManager {
         { ...req, model, options: mergedOptions },
         // Let the adapter name the file so it carries the correct extension for
         // the generated media type; we store that exact basename below.
-        { outputDir: dirname(join(baseDir, record.relativePath!)), apiKey, cfg }
+        { outputDir: dirname(join(baseDir, record.relativePath!)), apiKey, cfg, signal: cancel.signal }
       );
-      if (this.isCancelled(id)) {
+      if (this.isCancelled(id) || cancel.signal.aborted) {
         // cancel() flipped the row while the provider was still working. Keep
         // the row cancelled: drop the orphaned file instead of recording the
         // artifact, and report the cancelled state to the caller.
         try { await unlink(res.absolutePath); } catch { /* ignore */ }
-        this.cancellations.delete(id);
+        if (!this.isCancelled(id)) {
+          getDb().prepare('UPDATE media_artifacts SET status = ?, error = ?, finished_at = ? WHERE id = ?')
+            .run('cancelled', 'Cancelled by user', Date.now(), id);
+        }
         return this.toPublic({ ...record, status: 'cancelled', error: 'Cancelled by user', finishedAt: Date.now() });
       }
-      if (res.bytes > MAX_ARTIFACT_BYTES) {
+      if (res.bytes > MAX_MEDIA_BYTES) {
         // Remove the file we just wrote, then surface a friendly error.
         try { const { unlink: ul } = await import('node:fs/promises'); await ul(res.absolutePath); } catch { /* ignore */ }
-        throw new Error(`Generated artifact exceeds ${Math.round(MAX_ARTIFACT_BYTES / 1024 / 1024)} MB limit`);
+        throw new Error(`Generated artifact exceeds ${Math.round(MAX_MEDIA_BYTES / 1024 / 1024)} MB limit`);
       }
       const rel = `${month}/${basename(res.absolutePath)}`;
       const updated: Partial<MediaJobRecord> = {
@@ -342,22 +372,29 @@ export class MediaManager {
       };
       getDb().prepare(`UPDATE media_artifacts SET relative_path = ?, mime_type = ?, bytes = ?, status = ?, width = ?, height = ?, duration_seconds = ?, seed = ?, finished_at = ?, error = NULL WHERE id = ?`)
         .run(rel, res.mimeType, res.bytes, 'succeeded', res.width ?? null, res.height ?? null, res.durationSeconds ?? null, res.seed ?? null, Date.now(), id);
-      this.cancellations.delete(id);
       const pub = this.toPublic(updated);
       this.emit({ job: pub });
       return pub;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.cancellations.delete(id);
       // A row already flipped to 'cancelled' by cancel() must stay cancelled —
       // do not overwrite it with 'failed'.
-      if (!this.isCancelled(id)) {
+      if (this.isCancelled(id) || cancel.signal.aborted) {
+        if (!this.isCancelled(id)) {
+          getDb().prepare('UPDATE media_artifacts SET status = ?, error = ?, finished_at = ? WHERE id = ?')
+            .run('cancelled', 'Cancelled by user', Date.now(), id);
+        }
+        return this.toPublic({ ...record, status: 'cancelled', error: 'Cancelled by user', finishedAt: Date.now() });
+      } else {
         getDb().prepare('UPDATE media_artifacts SET status = ?, error = ?, finished_at = ? WHERE id = ?')
           .run('failed', msg, Date.now(), id);
         const pub = this.toPublic({ ...record, status: 'failed', error: msg, finishedAt: Date.now() });
         this.emit({ job: pub });
       }
       throw err;
+    } finally {
+      opts.signal?.removeEventListener('abort', onExternalAbort);
+      this.cancellations.delete(id);
     }
   }
 
@@ -368,6 +405,14 @@ export class MediaManager {
     getDb().prepare('UPDATE media_artifacts SET status = ?, error = ?, finished_at = ? WHERE id = ?')
       .run('cancelled', 'Cancelled by user', Date.now(), id);
     return true;
+  }
+
+  /** Abort and drain every active provider request before SQLite shuts down. */
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    const jobs = [...this.activeJobs.values()];
+    for (const id of [...this.cancellations.keys()]) this.cancel(id);
+    await Promise.allSettled(jobs);
   }
 
   /** True when cancel() already flipped this job's row to 'cancelled'. */
@@ -382,7 +427,8 @@ export class MediaManager {
   async copyArtifactToProject(artifactId: string, projectPath: string, subfolder = ''): Promise<{ ok: boolean; error?: string; path?: string }> {
     const row = getDb().prepare('SELECT * FROM media_artifacts WHERE id = ?').get(artifactId) as Record<string, unknown> | undefined;
     if (!row) return { ok: false, error: 'Artifact not found' };
-    const src = join(paths.media, row.relative_path as string);
+    const srcRoot = projectRootFor(row.project_id as string | null) || paths.media;
+    const src = join(srcRoot, row.relative_path as string);
     const target = join(projectPath, 'media', subfolder || '', `${artifactId}${extOf(row.relative_path as string)}`);
     if (!existsSync(src)) return { ok: false, error: 'Source file missing' };
     const dir = dirname(target);

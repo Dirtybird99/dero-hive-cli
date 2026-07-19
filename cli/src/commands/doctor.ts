@@ -49,7 +49,7 @@ export function doctorCommand(): Command {
       );
       const npmVersion = npm.status === 0 ? npm.stdout.trim() : '';
       const npmMajor = Number.parseInt(npmVersion.split('.')[0] || '0', 10);
-      checks.push({ label: 'npm', ok: npmMajor >= 10, required: true, detail: npmVersion ? `v${npmVersion} (10+ required)` : 'not found' });
+      checks.push({ label: 'npm', ok: npmMajor >= 12, required: true, detail: npmVersion ? `v${npmVersion} (12+ required)` : 'not found' });
 
       try {
         ensureDirs();

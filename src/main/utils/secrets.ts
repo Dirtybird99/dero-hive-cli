@@ -1,5 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { paths } from './paths';
 import { logger } from './logger';
 
@@ -16,6 +18,9 @@ const V1_PREFIX = 'v1:';
 const V2_PREFIX = 'v2:';
 const KEYCHAIN_SERVICE = 'dero-hive';
 const KEYCHAIN_ACCOUNT = 'secrets-master-key-v2';
+const MASTER_KEY_LOCK_FILE = '.dero-hive-secrets-master-key-v2.lock';
+const LOCK_WAIT_MS = 10_000;
+const INCOMPLETE_LOCK_STALE_MS = 30_000;
 
 type Backend = { kind: 'machine' } | { kind: 'keychain'; key: Buffer };
 let backend: Backend = { kind: 'machine' };
@@ -38,17 +43,95 @@ interface SecretStore {
   [key: string]: string;
 }
 
-function loadStore(): SecretStore {
+function loadStore(forMutation = false): SecretStore {
   if (!existsSync(paths.secrets)) return {};
   try {
-    return JSON.parse(readFileSync(paths.secrets, 'utf-8'));
-  } catch {
+    const parsed: unknown = JSON.parse(readFileSync(paths.secrets, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || Object.values(parsed).some((value) => typeof value !== 'string')) {
+      throw new Error('secret store must be an object of encrypted strings');
+    }
+    return parsed as SecretStore;
+  } catch (error) {
+    if (forMutation) throw new Error('Secret store is corrupt; refusing to overwrite it.', { cause: error });
+    logger.error('secrets', 'secret store is corrupt; reads fail closed');
     return {};
   }
 }
 
 function saveStore(store: SecretStore): void {
-  writeFileSync(paths.secrets, JSON.stringify(store, null, 2), { mode: 0o600 });
+  const temporary = `${paths.secrets}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(store, null, 2), { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, paths.secrets);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+function lockOwnerIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function reapStaleLock(path: string): void {
+  try {
+    const raw = readFileSync(path, 'utf8');
+    const owner = JSON.parse(raw) as { pid?: number };
+    if (lockOwnerIsAlive(owner.pid ?? 0)) return;
+    if (readFileSync(path, 'utf8') === raw) rmSync(path, { force: true });
+  } catch {
+    try {
+      if (Date.now() - statSync(path).mtimeMs >= INCOMPLETE_LOCK_STALE_MS) rmSync(path, { force: true });
+    } catch { /* another process changed the lock */ }
+  }
+}
+
+function withFileLock<T>(path: string, operation: () => T): T {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  const token = JSON.stringify({ pid: process.pid, nonce: randomBytes(12).toString('hex') });
+  while (true) {
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(path, 'wx', 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      reapStaleLock(path);
+      if (Date.now() >= deadline) {
+        throw new Error('Secret store is busy; timed out waiting for another Hive process.', { cause: error });
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      continue;
+    }
+    try {
+      writeFileSync(descriptor, token, 'utf8');
+    } catch (error) {
+      rmSync(path, { force: true });
+      throw error;
+    } finally {
+      closeSync(descriptor);
+    }
+    try {
+      return operation();
+    } finally {
+      try {
+        if (readFileSync(path, 'utf8') === token) rmSync(path, { force: true });
+      } catch { /* lock already disappeared */ }
+    }
+  }
+}
+
+function withStoreLock<T>(operation: () => T): T {
+  return withFileLock(`${paths.secrets}.lock`, operation);
+}
+
+function masterKeyLockPath(): string {
+  return join(homedir(), MASTER_KEY_LOCK_FILE);
 }
 
 function encryptWith(value: string, key: Buffer, prefix: string): string {
@@ -89,20 +172,32 @@ function decryptValue(raw: string): string | undefined {
   }
 }
 
+function loadOrCreateMasterKey(
+  getPassword: () => string | null,
+  setPassword: (value: string) => void,
+  lockPath: string
+): Buffer {
+  return withFileLock(lockPath, () => {
+    let hex: string | null;
+    try { hex = getPassword(); } catch { hex = null; }
+    if (!hex || !/^[0-9a-f]{64}$/i.test(hex)) {
+      setPassword(randomBytes(32).toString('hex'));
+      hex = getPassword();
+    }
+    if (!hex || !/^[0-9a-f]{64}$/i.test(hex)) throw new Error('OS keychain did not retain a valid master key.');
+    return Buffer.from(hex, 'hex');
+  });
+}
+
 async function loadOrCreateKeychainMasterKey(): Promise<Buffer | null> {
   try {
     const { Entry } = await import('@napi-rs/keyring');
     const entry = new Entry(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
-    let hex: string | null = null;
-    try {
-      hex = entry.getPassword();
-    } catch {
-      hex = null; // no existing entry
-    }
-    if (hex && /^[0-9a-f]{64}$/i.test(hex)) return Buffer.from(hex, 'hex');
-    const fresh = randomBytes(32);
-    entry.setPassword(fresh.toString('hex'));
-    return fresh;
+    return loadOrCreateMasterKey(
+      () => entry.getPassword(),
+      (value) => entry.setPassword(value),
+      masterKeyLockPath()
+    );
   } catch (err) {
     logger.warn('secrets', `OS keychain unavailable: ${err instanceof Error ? err.message : String(err)}`);
     return null;
@@ -126,9 +221,11 @@ export async function initSecrets(): Promise<void> {
 }
 
 export function setSecret(key: string, value: string): void {
-  const store = loadStore();
-  store[key] = encryptValue(value);
-  saveStore(store);
+  withStoreLock(() => {
+    const store = loadStore(true);
+    store[key] = encryptValue(value);
+    saveStore(store);
+  });
 }
 
 export function getSecret(key: string): string | undefined {
@@ -144,8 +241,12 @@ export function getSecret(key: string): string | undefined {
   // value to a v2 (sealed) envelope the next time it is read.
   if (backend.kind === 'keychain' && !raw.startsWith(V2_PREFIX)) {
     try {
-      store[key] = encryptValue(value);
-      saveStore(store);
+      withStoreLock(() => {
+        const current = loadStore(true);
+        if (current[key] !== raw) return;
+        current[key] = encryptValue(value);
+        saveStore(current);
+      });
     } catch (err) {
       logger.warn('secrets', `v1→v2 migration failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -154,9 +255,13 @@ export function getSecret(key: string): string | undefined {
 }
 
 export function deleteSecret(key: string): void {
-  const store = loadStore();
-  delete store[key];
-  saveStore(store);
+  if (!existsSync(paths.secrets)) return;
+  withStoreLock(() => {
+    const store = loadStore(true);
+    if (!(key in store)) return;
+    delete store[key];
+    saveStore(store);
+  });
 }
 
 /**
@@ -165,4 +270,16 @@ export function deleteSecret(key: string): void {
  */
 export function __setKeychainKeyForTest(key: Buffer | null): void {
   backend = key ? { kind: 'keychain', key } : { kind: 'machine' };
+}
+
+/** Test-only seam for exercising first-run key creation across processes. */
+export function __loadOrCreateMasterKeyForTest(
+  getPassword: () => string | null,
+  setPassword: (value: string) => void
+): Buffer {
+  return loadOrCreateMasterKey(getPassword, setPassword, masterKeyLockPath());
+}
+
+export function __masterKeyLockPathForTest(): string {
+  return masterKeyLockPath();
 }

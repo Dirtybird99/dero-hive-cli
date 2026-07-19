@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
+import { canonicalWorkspacePath } from '../../shared/workspace.js';
 
 // Each scenario gets its own data dir under one temp root; paths.db re-reads
 // HIVE_DATA_DIR on every access, so switching the env between closeDb/initDb
@@ -14,7 +16,7 @@ process.env.HIVE_CLI = '1';
 
 const { initDb, closeDb, getDb, getSetting, setSetting } = await import('./client.js');
 
-const CURRENT_SCHEMA_VERSION = 13;
+const CURRENT_SCHEMA_VERSION = 14;
 
 function tableNames(): Set<string> {
   const rows = getDb().prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>;
@@ -36,6 +38,33 @@ function schemaVersions(): number[] {
     .map((r) => r.version);
 }
 
+function runConcurrentInit(dataDir: string, worker: number): Promise<void> {
+  const clientUrl = new URL('./client.ts', import.meta.url).href;
+  const source = `
+    const client = await import(${JSON.stringify(clientUrl)});
+    await client.initDb();
+    if (client.getDb().pragma('integrity_check', { simple: true }) !== 'ok') process.exit(2);
+    client.closeDb();`;
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', source], {
+      cwd: process.cwd(),
+      env: { ...process.env, HIVE_DATA_DIR: dataDir, HIVE_CLI: '1' },
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 30_000);
+    child.once('error', reject);
+    child.once('close', (code) => {
+      clearTimeout(timeout);
+      if (code === 0) resolvePromise();
+      else reject(new Error(`concurrent init ${worker} exited ${code}: ${stderr}`));
+    });
+  });
+}
+
 try {
   // --- Before init: getDb throws, closeDb is a safe no-op ---
   assert.throws(() => getDb(), /DB not initialized/);
@@ -47,7 +76,25 @@ try {
   const db = getDb();
   assert.equal(db.pragma('journal_mode', { simple: true }), 'wal');
   assert.equal(db.pragma('foreign_keys', { simple: true }), 1);
-  assert.equal(db.pragma('synchronous', { simple: true }), 1); // NORMAL
+  assert.equal(db.pragma('synchronous', { simple: true }), 2); // FULL durability
+  assert.equal(db.pragma('busy_timeout', { simple: true }), 5_000);
+  if (process.platform !== 'win32') {
+    for (const file of [join(freshDir, 'hive.db'), join(freshDir, 'hive.db-wal'), join(freshDir, 'hive.db-shm')]) {
+      if (existsSync(file)) assert.equal(statSync(file).mode & 0o777, 0o600, `${file} is private`);
+    }
+  }
+
+  // WAL readers keep seeing the last committed snapshot while a writer is in
+  // flight, then observe the row immediately after commit.
+  const reader = new Database(join(freshDir, 'hive.db'), { readonly: true });
+  db.transaction(() => {
+    db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run('wal-visible', 'true', 1);
+    const during = reader.prepare('SELECT COUNT(*) AS count FROM settings WHERE key = ?').get('wal-visible') as { count: number };
+    assert.equal(during.count, 0);
+  }).immediate();
+  const after = reader.prepare('SELECT COUNT(*) AS count FROM settings WHERE key = ?').get('wal-visible') as { count: number };
+  assert.equal(after.count, 1);
+  reader.close();
 
   // --- Fresh init: real schema (tables + indices from sqlite_master) ---
   const tables = tableNames();
@@ -68,8 +115,9 @@ try {
   ]) {
     assert.ok(indices.has(expected), `expected index ${expected} to exist`);
   }
+  assert.ok(columnNames('conversations').has('workspace_path'));
 
-  // --- Fresh init: every migration is recorded (2..13), duplicate-column ones via INSERT OR IGNORE ---
+  // --- Fresh init: every migration is recorded (2..14) ---
   assert.deepEqual(schemaVersions(), Array.from({ length: CURRENT_SCHEMA_VERSION - 1 }, (_, i) => i + 2));
 
   // --- Settings helpers ---
@@ -104,8 +152,7 @@ try {
   const firstHandle = getDb();
   await initDb();
   assert.notEqual(getDb(), firstHandle); // a new handle replaces the global one
-  assert.equal(firstHandle.open, true); // quirk: the previous handle is left open (leaked), not closed
-  firstHandle.close();
+  assert.equal(firstHandle.open, false); // replacement never leaks the prior WAL handle
   assert.deepEqual(getSetting('persist-check'), { n: 1 });
   const kept = getDb().prepare('SELECT title FROM conversations WHERE id = ?').get('c-keep') as { title: string } | undefined;
   assert.equal(kept?.title, 'Keep me');
@@ -117,6 +164,41 @@ try {
   assert.doesNotThrow(() => closeDb()); // second close is a no-op
   await initDb();
   assert.deepEqual(getSetting('persist-check'), { n: 1 });
+  closeDb();
+
+  // Fresh startup is safe when several CLI processes negotiate WAL and run
+  // the idempotent migration chain at the same time.
+  const concurrentInitDir = join(rootDir, 'concurrent-init');
+  mkdirSync(concurrentInitDir, { recursive: true });
+  await Promise.all(Array.from({ length: 4 }, (_, worker) => runConcurrentInit(concurrentInitDir, worker)));
+  process.env.HIVE_DATA_DIR = concurrentInitDir;
+  await initDb();
+  assert.equal(getDb().pragma('integrity_check', { simple: true }), 'ok');
+  assert.deepEqual(schemaVersions(), Array.from({ length: CURRENT_SCHEMA_VERSION - 1 }, (_, i) => i + 2));
+  closeDb();
+
+  // A previously interrupted multi-column migration completes every missing
+  // effect instead of being marked done after encountering one duplicate.
+  const partialV5Dir = join(rootDir, 'partial-v5');
+  mkdirSync(partialV5Dir, { recursive: true });
+  const partialV5 = new Database(join(partialV5Dir, 'hive.db'));
+  partialV5.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      provider_id TEXT, model TEXT, system_prompt TEXT, pinned INTEGER DEFAULT 0, archived INTEGER DEFAULT 0,
+      project_id TEXT, parent_id TEXT, total_tokens INTEGER DEFAULT 0, message_count INTEGER DEFAULT 0,
+      preview TEXT, compaction_count INTEGER DEFAULT 0
+    );
+  `);
+  partialV5.prepare('INSERT INTO schema_version (version, applied_at) VALUES (5, 1000)').run();
+  partialV5.close();
+  process.env.HIVE_DATA_DIR = partialV5Dir;
+  await initDb();
+  assert.ok(columnNames('conversations').has('compaction_count'));
+  assert.ok(columnNames('conversations').has('last_compaction_at'));
+  assert.ok(columnNames('conversations').has('tokens_saved_by_compaction'));
+  assert.deepEqual(schemaVersions(), Array.from({ length: CURRENT_SCHEMA_VERSION - 4 }, (_, index) => index + 5));
   closeDb();
 
   // --- Legacy v1 database: migrations bring the schema to the current version without data loss ---
@@ -164,12 +246,13 @@ try {
 
   process.env.HIVE_DATA_DIR = legacy1Dir;
   await initDb();
-  assert.deepEqual(schemaVersions(), Array.from({ length: CURRENT_SCHEMA_VERSION }, (_, i) => i + 1)); // 1..13
+  assert.deepEqual(schemaVersions(), Array.from({ length: CURRENT_SCHEMA_VERSION }, (_, i) => i + 1)); // 1..14
   assert.ok(columnNames('conversations').has('project_id')); // v3
   assert.ok(columnNames('conversations').has('parent_id')); // v4
   assert.ok(columnNames('conversations').has('compaction_count')); // v5
   assert.ok(columnNames('conversations').has('last_compaction_at'));
   assert.ok(columnNames('conversations').has('tokens_saved_by_compaction'));
+  assert.ok(columnNames('conversations').has('workspace_path')); // v14
   assert.ok(columnNames('messages').has('bookmarked')); // v6
   assert.ok(columnNames('providers').has('models_fetched_at')); // v2
   assert.ok(columnNames('mcp_servers').has('transport')); // v7
@@ -179,9 +262,10 @@ try {
   assert.ok(indexNames().has('idx_msg_bookmarked'));
   // Legacy data survives the whole migration chain.
   assert.equal(getSetting('legacy-key'), 'legacy-value');
-  const legacyConv = getDb().prepare('SELECT title, project_id FROM conversations WHERE id = ?').get('c-legacy') as { title: string; project_id: string | null };
+  const legacyConv = getDb().prepare('SELECT title, project_id, workspace_path FROM conversations WHERE id = ?').get('c-legacy') as { title: string; project_id: string | null; workspace_path: string | null };
   assert.equal(legacyConv.title, 'Legacy chat');
   assert.equal(legacyConv.project_id, null); // new column backfills as NULL
+  assert.equal(legacyConv.workspace_path, null); // unknown legacy scope is never guessed
   const legacyMsg = getDb().prepare('SELECT content, bookmarked FROM messages WHERE id = ?').get('m-legacy') as { content: string; bookmarked: number };
   assert.equal(legacyMsg.content, 'legacy message');
   assert.equal(legacyMsg.bookmarked, 0); // ALTER ... DEFAULT 0 backfill
@@ -222,7 +306,7 @@ try {
 
   process.env.HIVE_DATA_DIR = legacy12Dir;
   await initDb();
-  assert.deepEqual(schemaVersions(), [12, 13]); // only the pending migration ran
+  assert.deepEqual(schemaVersions(), [12, 13, 14]); // only the pending migrations ran
   assert.ok(columnNames('media_providers').has('default_audio_model'));
   assert.ok(columnNames('media_providers').has('audio_models'));
   const rebuiltSql = (getDb().prepare(
@@ -245,6 +329,48 @@ try {
     .get('mp-legacy') as { name: string; default_audio_model: string | null };
   assert.equal(legacyMediaProvider.name, 'Legacy media provider');
   assert.equal(legacyMediaProvider.default_audio_model, null); // new column backfills as NULL
+  closeDb();
+
+  // --- Legacy v13: project-bound conversations gain canonical scope; truly
+  // unscoped history stays NULL so callers cannot guess and cross workspaces. ---
+  const legacy13Dir = join(rootDir, 'legacy-v13');
+  const legacyWorkspace = join(rootDir, 'legacy-workspace');
+  mkdirSync(legacy13Dir, { recursive: true });
+  mkdirSync(legacyWorkspace, { recursive: true });
+  const seed13 = new Database(join(legacy13Dir, 'hive.db'));
+  seed13.exec(`
+    CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+    CREATE TABLE projects (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, icon TEXT DEFAULT '📁', color TEXT, path TEXT NOT NULL,
+      config TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      provider_id TEXT, model TEXT, system_prompt TEXT, pinned INTEGER DEFAULT 0, archived INTEGER DEFAULT 0,
+      project_id TEXT REFERENCES projects(id), parent_id TEXT, total_tokens INTEGER DEFAULT 0,
+      message_count INTEGER DEFAULT 0, preview TEXT, compaction_count INTEGER DEFAULT 0,
+      last_compaction_at INTEGER, tokens_saved_by_compaction INTEGER DEFAULT 0
+    );
+  `);
+  seed13.prepare('INSERT INTO schema_version (version, applied_at) VALUES (13, 3000)').run();
+  seed13.prepare(`
+    INSERT INTO projects (id, name, path, created_at, updated_at) VALUES ('legacy-project', 'Legacy', ?, 1, 1)
+  `).run(legacyWorkspace);
+  seed13.prepare(`
+    INSERT INTO conversations (id, title, created_at, updated_at, project_id)
+    VALUES ('legacy-scoped', 'Scoped', 1, 1, 'legacy-project'), ('legacy-unscoped', 'Unscoped', 1, 1, NULL)
+  `).run();
+  seed13.close();
+  process.env.HIVE_DATA_DIR = legacy13Dir;
+  await initDb();
+  assert.deepEqual(schemaVersions(), [13, 14]);
+  const migratedScopes = getDb().prepare(
+    'SELECT id, workspace_path FROM conversations ORDER BY id'
+  ).all() as Array<{ id: string; workspace_path: string | null }>;
+  assert.deepEqual(migratedScopes, [
+    { id: 'legacy-scoped', workspace_path: canonicalWorkspacePath(legacyWorkspace) },
+    { id: 'legacy-unscoped', workspace_path: null }
+  ]);
 } finally {
   closeDb();
   rmSync(rootDir, { recursive: true, force: true });

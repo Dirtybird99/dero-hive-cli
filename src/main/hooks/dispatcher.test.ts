@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { evaluatePreToolUse, evaluatePostToolUse } from './dispatcher.js';
 import type { HookDefinition } from './types.js';
 
@@ -47,6 +48,46 @@ try {
   assert.equal((await evaluatePreToolUse([slowOpen], 'run_shell', {})).block, false, 'timed-out non-blocking hook must fail open');
   assert.ok(Date.now() - openStart < 5_000, 'timed-out hook must settle at its timeout, not hang');
   assert.equal((await evaluatePreToolUse([slowClosed], 'run_shell', {})).block, true, 'timed-out blocking hook must fail closed');
+
+  // Timeout terminates the shell's descendants, not only the shell process.
+  const descendantScript = join(root, 'descendant.cjs');
+  const parentScript = join(root, 'parent.cjs');
+  const descendantReady = join(root, 'descendant-ready.txt');
+  const descendantMarker = join(root, 'descendant-escaped.txt');
+  writeFileSync(descendantScript, `
+const fs = require('node:fs');
+setTimeout(() => fs.writeFileSync(process.argv[2], 'escaped'), 1500);
+`);
+  writeFileSync(parentScript, `
+const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+const child = spawn(process.execPath, [process.argv[2], process.argv[3]], { stdio: 'ignore' });
+fs.writeFileSync(process.argv[4], String(child.pid));
+setTimeout(() => {}, 4000);
+`);
+  const descendantHook: HookDefinition = {
+    event: 'preToolUse',
+    command: `${q(NODE)} ${q(parentScript)} ${q(descendantScript)} ${q(descendantMarker)} ${q(descendantReady)}`,
+    timeoutMs: 500,
+    blocking: true
+  };
+  assert.equal((await evaluatePreToolUse([descendantHook], 'run_shell', {})).block, true);
+  assert.equal(existsSync(descendantReady), true, 'hook descendant was running before the timeout');
+  await delay(1_800);
+  assert.equal(existsSync(descendantMarker), false, 'timed-out hook must terminate its descendant tree');
+
+  // Hook output is capped and overflow terminates the producer promptly.
+  const oversizedHook: HookDefinition = {
+    event: 'preToolUse',
+    command: runNode("process.stdout.write('x'.repeat(300000));setTimeout(function(){},4000)"),
+    timeoutMs: 4_000,
+    blocking: true
+  };
+  const oversizedStart = Date.now();
+  const oversized = await evaluatePreToolUse([oversizedHook], 'run_shell', {});
+  assert.equal(oversized.block, true);
+  assert.match(oversized.feedback || '', /output exceeded 262144 bytes/u);
+  assert.ok(Date.now() - oversizedStart < 3_000, 'oversized hook output is stopped before its normal timeout');
 
   // The first denying hook short-circuits (the second, which would write a marker, must not run).
   const marker = join(root, 'should-not-exist.txt');

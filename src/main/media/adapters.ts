@@ -1,7 +1,18 @@
-import { writeFile } from 'node:fs/promises';
+import { rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { MediaGenerationRequest, MediaProviderConfig, MediaKind } from '@shared/types';
+import {
+  abortableMediaDelay,
+  downloadReturnedMedia,
+  fetchMediaResponse,
+  MAX_MEDIA_API_BODY_BYTES,
+  MAX_MEDIA_BYTES,
+  MAX_MEDIA_CONTROL_BODY_BYTES,
+  MEDIA_REQUEST_TIMEOUT_MS,
+  MEDIA_TEST_TIMEOUT_MS,
+  type MediaHttpResponse
+} from './http';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Adapter interface
@@ -29,6 +40,10 @@ export interface MediaAdapterContext {
   apiKey: string;
   /** Provider config (already merged with presets). */
   cfg: MediaProviderConfig;
+  /** Cancels provider requests, polling sleeps, downloads, and file writes. */
+  signal?: AbortSignal;
+  /** Internal/test override; production requests use the shared media deadline. */
+  requestTimeoutMs?: number;
 }
 
 export interface MediaAdapter {
@@ -79,9 +94,18 @@ function makeFilename(kind: MediaKind, ext: string): string {
   return `${kind}-${stamp}-${id}${safeExt}`;
 }
 
-async function writeBuffer(absPath: string, buf: Buffer): Promise<number> {
-  await writeFile(absPath, buf);
-  return buf.length;
+async function writeBuffer(absPath: string, buf: Buffer, signal?: AbortSignal): Promise<number> {
+  if (buf.length > MAX_MEDIA_BYTES) throw new Error('Generated artifact exceeds 50 MB limit');
+  signal?.throwIfAborted();
+  const partial = `${absPath}.partial-${randomUUID()}`;
+  try {
+    await writeFile(partial, buf, { signal });
+    signal?.throwIfAborted();
+    await rename(partial, absPath);
+    return buf.length;
+  } finally {
+    try { await unlink(partial); } catch { /* renamed or already removed */ }
+  }
 }
 
 function resolveAspectOrDefault(req: MediaGenerationRequest): { width: number; height: number } {
@@ -92,6 +116,56 @@ function resolveAspectOrDefault(req: MediaGenerationRequest): { width: number; h
 
 function readJsonSafe(text: string): Record<string, unknown> | null {
   try { return JSON.parse(text) as Record<string, unknown>; } catch { return null; }
+}
+
+function responseText(response: MediaHttpResponse): string {
+  return response.body.toString('utf8');
+}
+
+function apiRequest(
+  url: string,
+  init: RequestInit,
+  ctx: MediaAdapterContext,
+  maxBytes = MAX_MEDIA_CONTROL_BODY_BYTES
+): Promise<MediaHttpResponse> {
+  return fetchMediaResponse(url, init, {
+    signal: ctx.signal,
+    timeoutMs: ctx.requestTimeoutMs,
+    maxBytes
+  });
+}
+
+function probeRequest(url: string, init: RequestInit = {}): Promise<MediaHttpResponse> {
+  return fetchMediaResponse(url, init, { timeoutMs: MEDIA_TEST_TIMEOUT_MS, maxBytes: MAX_MEDIA_CONTROL_BODY_BYTES });
+}
+
+function returnedDownload(url: string, ctx: MediaAdapterContext): Promise<MediaHttpResponse> {
+  return downloadReturnedMedia(url, ctx.cfg.baseUrl || '', {
+    signal: ctx.signal,
+    timeoutMs: ctx.requestTimeoutMs
+  });
+}
+
+function withinDeadline(ctx: MediaAdapterContext, deadline: number): MediaAdapterContext {
+  return {
+    ...ctx,
+    requestTimeoutMs: Math.max(1, Math.min(ctx.requestTimeoutMs ?? MEDIA_REQUEST_TIMEOUT_MS, deadline - Date.now()))
+  };
+}
+
+function decodeBase64Artifact(value: string): Buffer {
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  if (Math.floor(value.length * 3 / 4) - padding > MAX_MEDIA_BYTES) throw new Error('Generated artifact exceeds 50 MB limit');
+  const buffer = Buffer.from(value, 'base64');
+  if (buffer.length > MAX_MEDIA_BYTES) throw new Error('Generated artifact exceeds 50 MB limit');
+  return buffer;
+}
+
+function decodeHexArtifact(value: string): Buffer {
+  if (Math.ceil(value.length / 2) > MAX_MEDIA_BYTES) throw new Error('Generated artifact exceeds 50 MB limit');
+  const buffer = Buffer.from(value, 'hex');
+  if (buffer.length > MAX_MEDIA_BYTES) throw new Error('Generated artifact exceeds 50 MB limit');
+  return buffer;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -121,7 +195,7 @@ export class OpenAIImageAdapter implements MediaAdapter {
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     if (!this.apiKey) return { ok: false, error: 'API key required' };
     try {
-      const r = await fetch(`${this.baseUrl()}/models`, { headers: this.headers() });
+      const r = await probeRequest(`${this.baseUrl()}/models`, { headers: this.headers() });
       if (r.ok) return { ok: true };
       if (r.status === 401 || r.status === 403) return { ok: false, error: `Auth failed (${r.status})`, hint: 'Check the OpenAI API key.' };
       return { ok: false, error: `HTTP ${r.status}` };
@@ -142,16 +216,16 @@ export class OpenAIImageAdapter implements MediaAdapter {
     };
     if (model === 'dall-e-3' && typeof req.seed === 'number') body.seed = Math.floor(req.seed);
 
-    const resp = await fetch(`${this.baseUrl()}/images/generations`, {
+    const resp = await apiRequest(`${this.baseUrl()}/images/generations`, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(body)
-    });
+    }, ctx, MAX_MEDIA_API_BODY_BYTES);
     if (!resp.ok) {
-      const t = await resp.text();
+      const t = responseText(resp);
       throw new Error(`OpenAI image error: ${resp.status} ${t.slice(0, 400)}`);
     }
-    const json = readJsonSafe(await resp.text()) as { data?: Array<{ b64_json?: string; url?: string }> } | null;
+    const json = readJsonSafe(responseText(resp)) as { data?: Array<{ b64_json?: string; url?: string }> } | null;
     const first = json?.data?.[0];
     if (!first) throw new Error('OpenAI returned no image');
 
@@ -159,14 +233,13 @@ export class OpenAIImageAdapter implements MediaAdapter {
     let mime: string;
     let ext: string;
     if (first.b64_json) {
-      buffer = Buffer.from(first.b64_json, 'base64');
+      buffer = decodeBase64Artifact(first.b64_json);
       mime = 'image/png';
       ext = 'png';
     } else if (first.url) {
-      const r = await fetch(first.url);
+      const r = await returnedDownload(first.url, ctx);
       if (!r.ok) throw new Error(`OpenAI image URL fetch failed: ${r.status}`);
-      const arr = new Uint8Array(await r.arrayBuffer());
-      buffer = Buffer.from(arr);
+      buffer = r.body;
       mime = r.headers.get('content-type') || 'image/png';
       ext = mimeToExt(mime);
     } else {
@@ -176,7 +249,7 @@ export class OpenAIImageAdapter implements MediaAdapter {
     const filename = makeFilename('image', ext);
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    const bytes = await writeBuffer(abs, buffer);
+    const bytes = await writeBuffer(abs, buffer, ctx.signal);
     return { absolutePath: abs, relativePath: relative, mimeType: mime, bytes, width, height, seed: req.seed };
   }
 }
@@ -232,7 +305,7 @@ export class StabilityAdapter implements MediaAdapter {
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     if (!this.apiKey) return { ok: false, error: 'API key required' };
     try {
-      const r = await fetch(`${this.baseUrl()}/v1/user/accounts`, { headers: this.headers() });
+      const r = await probeRequest(`${this.baseUrl()}/v1/user/accounts`, { headers: this.headers() });
       if (r.ok) return { ok: true };
       if (r.status === 401 || r.status === 403) return { ok: false, error: `Auth failed (${r.status})`, hint: 'Get a key at platform.stability.ai.' };
       return { ok: false, error: `HTTP ${r.status}` };
@@ -257,7 +330,7 @@ export class StabilityAdapter implements MediaAdapter {
     if (typeof req.seed === 'number') form.append('seed', String(Math.floor(req.seed)));
     if (typeof req.cfgScale === 'number') form.append('cfg_scale', String(req.cfgScale));
 
-    const resp = await fetch(endpoint, {
+    const resp = await apiRequest(endpoint, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
@@ -265,17 +338,16 @@ export class StabilityAdapter implements MediaAdapter {
         ...(this.cfg.customHeaders || {})
       },
       body: form
-    });
+    }, ctx, MAX_MEDIA_BYTES);
     if (!resp.ok) {
-      const t = await resp.text();
+      const t = responseText(resp);
       throw new Error(`Stability error: ${resp.status} ${t.slice(0, 400)}`);
     }
-    const arr = new Uint8Array(await resp.arrayBuffer());
-    const buf = Buffer.from(arr);
+    const buf = resp.body;
     const filename = makeFilename('image', 'png');
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    const bytes = await writeBuffer(abs, buf);
+    const bytes = await writeBuffer(abs, buf, ctx.signal);
     return { absolutePath: abs, relativePath: relative, mimeType: 'image/png', bytes, width, height, seed: req.seed };
   }
 }
@@ -293,7 +365,7 @@ export class PollinationsAdapter implements MediaAdapter {
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     try {
       const url = `https://image.pollinations.ai/prompt/test?width=64&height=64&nologo=true`;
-      const r = await fetch(url, { method: 'HEAD' });
+      const r = await probeRequest(url, { method: 'HEAD' });
       if (r.ok || r.status === 200 || r.status === 302) return { ok: true };
       return { ok: false, error: `HTTP ${r.status}` };
     } catch (err) {
@@ -311,16 +383,15 @@ export class PollinationsAdapter implements MediaAdapter {
     u.searchParams.set('nologo', 'true');
     if (typeof req.seed === 'number') u.searchParams.set('seed', String(Math.floor(req.seed)));
     u.searchParams.set('enhance', 'true');
-    const resp = await fetch(u.toString());
+    const resp = await apiRequest(u.toString(), {}, ctx, MAX_MEDIA_BYTES);
     if (!resp.ok) throw new Error(`Pollinations error: ${resp.status}`);
-    const arr = new Uint8Array(await resp.arrayBuffer());
-    const buf = Buffer.from(arr);
+    const buf = resp.body;
     const mime = resp.headers.get('content-type') || 'image/jpeg';
     const ext = mimeToExt(mime);
     const filename = makeFilename('image', ext);
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    const bytes = await writeBuffer(abs, buf);
+    const bytes = await writeBuffer(abs, buf, ctx.signal);
     return { absolutePath: abs, relativePath: relative, mimeType: mime, bytes, width, height, seed: req.seed };
   }
 }
@@ -354,7 +425,7 @@ export class ReplicateAdapter implements MediaAdapter {
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     if (!this.apiKey) return { ok: false, error: 'Replicate API token required' };
     try {
-      const r = await fetch(`${this.baseUrl()}/models?limit=1`, { headers: this.headers() });
+      const r = await probeRequest(`${this.baseUrl()}/models?limit=1`, { headers: this.headers() });
       if (r.ok) return { ok: true };
       if (r.status === 401 || r.status === 403) return { ok: false, error: `Auth failed (${r.status})`, hint: 'Check your Replicate API token.' };
       return { ok: false, error: `HTTP ${r.status}` };
@@ -398,16 +469,16 @@ export class ReplicateAdapter implements MediaAdapter {
     }
 
     // Start prediction
-    const startResp = await fetch(`${this.baseUrl()}/models/${model}/predictions`, {
+    const startResp = await apiRequest(`${this.baseUrl()}/models/${model}/predictions`, {
       method: 'POST',
       headers: this.headers({ Prefer: 'wait' }),
       body: JSON.stringify({ input })
-    });
+    }, ctx);
     if (!startResp.ok) {
-      const t = await startResp.text();
+      const t = responseText(startResp);
       throw new Error(`Replicate start failed: ${startResp.status} ${t.slice(0, 400)}`);
     }
-    let prediction = readJsonSafe(await startResp.text()) as { id?: string; urls?: { get?: string }; status?: string; output?: unknown } | null;
+    let prediction = readJsonSafe(responseText(startResp)) as { id?: string; urls?: { get?: string }; status?: string; output?: unknown } | null;
     if (!prediction?.id) throw new Error('Replicate returned no prediction id');
     const getUrl = prediction.urls?.get || `${this.baseUrl()}/predictions/${prediction.id}`;
 
@@ -415,27 +486,33 @@ export class ReplicateAdapter implements MediaAdapter {
     const deadline = Date.now() + 5 * 60_000;
     while (Date.now() < deadline) {
       if (prediction.status === 'succeeded' || prediction.status === 'failed' || prediction.status === 'canceled') break;
-      await new Promise((r) => setTimeout(r, 1500));
-      const poll = await fetch(getUrl, { headers: this.headers() });
+      await abortableMediaDelay(Math.min(1500, deadline - Date.now()), ctx.signal);
+      if (Date.now() >= deadline) break;
+      const pollCtx = withinDeadline(ctx, deadline);
+      const poll = await downloadReturnedMedia(getUrl, this.baseUrl(), {
+        signal: ctx.signal,
+        timeoutMs: pollCtx.requestTimeoutMs,
+        maxBytes: MAX_MEDIA_CONTROL_BODY_BYTES,
+        init: { headers: this.headers() }
+      });
       if (!poll.ok) throw new Error(`Replicate poll error: ${poll.status}`);
-      prediction = readJsonSafe(await poll.text()) as typeof prediction;
+      prediction = readJsonSafe(responseText(poll)) as typeof prediction;
     }
     if (prediction?.status !== 'succeeded') throw new Error(`Replicate prediction ${prediction?.status || 'unknown'}: ${(prediction as { error?: string })?.error || ''}`);
     const output = prediction?.output;
     const mediaUrl = extractReplicateOutput(output);
     if (!mediaUrl) throw new Error('Replicate returned no media');
 
-    const dl = await fetch(mediaUrl);
+    const dl = await returnedDownload(mediaUrl, ctx);
     if (!dl.ok) throw new Error(`Replicate download failed: ${dl.status}`);
-    const arr = new Uint8Array(await dl.arrayBuffer());
-    const buf = Buffer.from(arr);
+    const buf = dl.body;
     const defaultMime = this.kind === 'video' ? 'video/mp4' : this.kind === 'audio' ? 'audio/mpeg' : 'image/png';
     const mime = dl.headers.get('content-type') || defaultMime;
     const ext = mimeToExt(mime, this.kind);
     const filename = makeFilename(this.kind, ext);
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    const bytes = await writeBuffer(abs, buf);
+    const bytes = await writeBuffer(abs, buf, ctx.signal);
     return {
       absolutePath: abs,
       relativePath: relative,
@@ -495,7 +572,7 @@ export class ComfyUIAdapter implements MediaAdapter {
 
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     try {
-      const r = await fetch(`${this.baseUrl()}/system_stats`);
+      const r = await probeRequest(`${this.baseUrl()}/system_stats`);
       if (r.ok) return { ok: true };
       return { ok: false, error: `HTTP ${r.status}`, hint: 'Start ComfyUI with --api and ensure the URL matches the listening interface.' };
     } catch (err) {
@@ -518,21 +595,21 @@ export class ComfyUIAdapter implements MediaAdapter {
       cfg: req.cfgScale || 7
     });
 
-    const queueResp = await fetch(`${this.baseUrl()}/prompt`, {
+    const queueResp = await apiRequest(`${this.baseUrl()}/prompt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(this.cfg.customHeaders || {}) },
       body: JSON.stringify({ prompt: workflow })
-    });
-    if (!queueResp.ok) throw new Error(`ComfyUI queue failed: ${queueResp.status} ${await queueResp.text()}`);
-    const queued = readJsonSafe(await queueResp.text()) as { prompt_id?: string } | null;
+    }, ctx);
+    if (!queueResp.ok) throw new Error(`ComfyUI queue failed: ${queueResp.status} ${responseText(queueResp)}`);
+    const queued = readJsonSafe(responseText(queueResp)) as { prompt_id?: string } | null;
     const promptId = queued?.prompt_id;
     if (!promptId) throw new Error('ComfyUI returned no prompt_id');
 
     const deadline = Date.now() + 10 * 60_000;
     while (Date.now() < deadline) {
-      const hist = await fetch(`${this.baseUrl()}/history/${promptId}`);
+      const hist = await apiRequest(`${this.baseUrl()}/history/${promptId}`, {}, withinDeadline(ctx, deadline));
       if (hist.ok) {
-        const data = readJsonSafe(await hist.text()) as Record<string, { outputs?: Record<string, { images?: Array<{ filename: string; subfolder?: string; type?: string }>; gifs?: Array<{ filename: string; subfolder?: string }> }> }> | null;
+        const data = readJsonSafe(responseText(hist)) as Record<string, { outputs?: Record<string, { images?: Array<{ filename: string; subfolder?: string; type?: string }>; gifs?: Array<{ filename: string; subfolder?: string }> }> }> | null;
         const entry = data?.[promptId];
         if (entry?.outputs) {
           const outs = Object.values(entry.outputs);
@@ -541,16 +618,15 @@ export class ComfyUIAdapter implements MediaAdapter {
             if (candidates.length === 0) continue;
             const media = candidates[0];
             const queryParams = new URLSearchParams({ filename: media.filename, subfolder: media.subfolder || '', type: media.type || 'output' }).toString();
-            const dl = await fetch(`${this.baseUrl()}/view?${queryParams}`);
+            const dl = await apiRequest(`${this.baseUrl()}/view?${queryParams}`, {}, ctx, MAX_MEDIA_BYTES);
             if (!dl.ok) continue;
-            const arr = new Uint8Array(await dl.arrayBuffer());
-            const buf = Buffer.from(arr);
+            const buf = dl.body;
             const mime = dl.headers.get('content-type') || (this.kind === 'video' ? 'image/gif' : 'image/png');
             const ext = mimeToExt(mime, this.kind);
             const filename = makeFilename(this.kind, ext);
             const abs = join(ctx.outputDir, ctx.filename || filename);
             const relative = ctx.filename || filename;
-            const bytes = await writeBuffer(abs, buf);
+            const bytes = await writeBuffer(abs, buf, ctx.signal);
             return {
               absolutePath: abs, relativePath: relative, mimeType: mime, bytes,
               width, height, durationSeconds: this.kind === 'video' ? req.durationSeconds : undefined, seed
@@ -558,7 +634,7 @@ export class ComfyUIAdapter implements MediaAdapter {
           }
         }
       }
-      await new Promise((r) => setTimeout(r, 1000));
+      await abortableMediaDelay(Math.min(1000, Math.max(1, deadline - Date.now())), ctx.signal);
     }
     throw new Error('ComfyUI job timed out');
   }
@@ -603,7 +679,7 @@ export class A1111Adapter implements MediaAdapter {
 
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     try {
-      const r = await fetch(`${this.baseUrl()}/sd-api/v1/options`);
+      const r = await probeRequest(`${this.baseUrl()}/sd-api/v1/options`);
       if (r.ok) return { ok: true };
       return { ok: false, error: `HTTP ${r.status}`, hint: 'Start A1111 with --api and ensure the URL matches.' };
     } catch (err) {
@@ -625,20 +701,20 @@ export class A1111Adapter implements MediaAdapter {
       batch_size: 1,
       n_iter: 1
     };
-    const resp = await fetch(`${this.baseUrl()}/sd-api/v1/txt2img`, {
+    const resp = await apiRequest(`${this.baseUrl()}/sd-api/v1/txt2img`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(this.cfg.customHeaders || {}) },
       body: JSON.stringify(body)
-    });
+    }, ctx, MAX_MEDIA_API_BODY_BYTES);
     if (!resp.ok) throw new Error(`A1111 error: ${resp.status}`);
-    const json = readJsonSafe(await resp.text()) as { images?: string[]; info?: string } | null;
+    const json = readJsonSafe(responseText(resp)) as { images?: string[]; info?: string } | null;
     const b64 = json?.images?.[0];
     if (!b64) throw new Error('A1111 returned no image');
-    const buf = Buffer.from(b64, 'base64');
+    const buf = decodeBase64Artifact(b64);
     const filename = makeFilename('image', 'png');
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    const bytes = await writeBuffer(abs, buf);
+    const bytes = await writeBuffer(abs, buf, ctx.signal);
     let seedOut: number | undefined;
     try { seedOut = JSON.parse(json?.info || '{}')?.seed as number; } catch { /* ignore */ }
     return { absolutePath: abs, relativePath: relative, mimeType: 'image/png', bytes, width, height, seed: seedOut ?? req.seed };
@@ -665,7 +741,7 @@ export class OpenAICompatibleImageAdapter implements MediaAdapter {
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     if (!this.baseUrl()) return { ok: false, error: 'Base URL required' };
     try {
-      const r = await fetch(`${this.baseUrl()}/models`, { headers: this.headers() });
+      const r = await probeRequest(`${this.baseUrl()}/models`, { headers: this.headers() });
       if (r.ok) return { ok: true };
       if (r.status === 401 || r.status === 403) return { ok: false, error: `Auth failed (${r.status})`, hint: 'Check the API key / Authorization header.' };
       return { ok: false, error: `HTTP ${r.status}` };
@@ -689,22 +765,22 @@ export class OpenAICompatibleImageAdapter implements MediaAdapter {
     if (typeof req.steps === 'number') body.steps = req.steps;
     if (typeof req.cfgScale === 'number') body.cfg_scale = req.cfgScale;
 
-    const resp = await fetch(`${this.baseUrl()}/images/generations`, {
+    const resp = await apiRequest(`${this.baseUrl()}/images/generations`, {
       method: 'POST', headers: this.headers(), body: JSON.stringify(body)
-    });
-    if (!resp.ok) throw new Error(`Image API error: ${resp.status} ${(await resp.text()).slice(0, 400)}`);
-    const json = readJsonSafe(await resp.text()) as { data?: Array<{ b64_json?: string; url?: string }> } | null;
+    }, ctx, MAX_MEDIA_API_BODY_BYTES);
+    if (!resp.ok) throw new Error(`Image API error: ${resp.status} ${responseText(resp).slice(0, 400)}`);
+    const json = readJsonSafe(responseText(resp)) as { data?: Array<{ b64_json?: string; url?: string }> } | null;
     const first = json?.data?.[0];
     if (!first) throw new Error('Image API returned no data');
     let buf: Buffer;
     let mime: string;
     if (first.b64_json) {
-      buf = Buffer.from(first.b64_json, 'base64');
+      buf = decodeBase64Artifact(first.b64_json);
       mime = 'image/png';
     } else if (first.url) {
-      const r = await fetch(first.url);
+      const r = await returnedDownload(first.url, ctx);
       if (!r.ok) throw new Error(`Image URL fetch failed: ${r.status}`);
-      buf = Buffer.from(new Uint8Array(await r.arrayBuffer()));
+      buf = r.body;
       mime = r.headers.get('content-type') || 'image/png';
     } else {
       throw new Error('Image API returned no usable data');
@@ -713,7 +789,7 @@ export class OpenAICompatibleImageAdapter implements MediaAdapter {
     const filename = makeFilename('image', ext);
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    const bytes = await writeBuffer(abs, buf);
+    const bytes = await writeBuffer(abs, buf, ctx.signal);
     return { absolutePath: abs, relativePath: relative, mimeType: mime, bytes, width, height, seed: req.seed };
   }
 }
@@ -736,7 +812,7 @@ export class OpenAITTSAdapter implements MediaAdapter {
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     if (!this.apiKey) return { ok: false, error: 'API key required' };
     try {
-      const r = await fetch(`${this.baseUrl()}/models`, { headers: this.headers() });
+      const r = await probeRequest(`${this.baseUrl()}/models`, { headers: this.headers() });
       if (r.ok) return { ok: true };
       if (r.status === 401 || r.status === 403) return { ok: false, error: `Auth failed (${r.status})`, hint: 'Check the OpenAI API key.' };
       return { ok: false, error: `HTTP ${r.status}` };
@@ -750,19 +826,19 @@ export class OpenAITTSAdapter implements MediaAdapter {
     const model = req.model || this.cfg.defaultAudioModel || 'gpt-4o-mini-tts';
     const voice = req.voice || 'alloy';
     const format = (req.format || 'mp3').toLowerCase();
-    const resp = await fetch(`${this.baseUrl()}/audio/speech`, {
+    const resp = await apiRequest(`${this.baseUrl()}/audio/speech`, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify({ model, input: req.prompt, voice, response_format: format })
-    });
-    if (!resp.ok) throw new Error(`OpenAI speech error: ${resp.status} ${(await resp.text()).slice(0, 400)}`);
-    const buf = Buffer.from(new Uint8Array(await resp.arrayBuffer()));
+    }, ctx, MAX_MEDIA_BYTES);
+    if (!resp.ok) throw new Error(`OpenAI speech error: ${resp.status} ${responseText(resp).slice(0, 400)}`);
+    const buf = resp.body;
     const mime = resp.headers.get('content-type') || guessMimeFromExt(format);
     const ext = audioExtFromMime(mime) || format;
     const filename = makeFilename('audio', ext);
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    const bytes = await writeBuffer(abs, buf);
+    const bytes = await writeBuffer(abs, buf, ctx.signal);
     return { absolutePath: abs, relativePath: relative, mimeType: mime, bytes };
   }
 }
@@ -790,7 +866,7 @@ export class ElevenLabsAdapter implements MediaAdapter {
   async test(): Promise<{ ok: boolean; error?: string; hint?: string }> {
     if (!this.apiKey) return { ok: false, error: 'API key required' };
     try {
-      const r = await fetch(`${this.baseUrl()}/v1/user`, { headers: this.headers() });
+      const r = await probeRequest(`${this.baseUrl()}/v1/user`, { headers: this.headers() });
       if (r.ok) return { ok: true };
       if (r.status === 401 || r.status === 403) return { ok: false, error: `Auth failed (${r.status})`, hint: 'Check the ElevenLabs API key.' };
       return { ok: false, error: `HTTP ${r.status}` };
@@ -803,19 +879,19 @@ export class ElevenLabsAdapter implements MediaAdapter {
     if (!this.apiKey) throw new Error('ElevenLabs API key not set');
     const model = req.model || this.cfg.defaultAudioModel || 'eleven_multilingual_v2';
     const voiceId = req.voice || ELEVENLABS_DEFAULT_VOICE;
-    const resp = await fetch(`${this.baseUrl()}/v1/text-to-speech/${encodeURIComponent(voiceId)}`, {
+    const resp = await apiRequest(`${this.baseUrl()}/v1/text-to-speech/${encodeURIComponent(voiceId)}`, {
       method: 'POST',
       headers: this.headers({ 'Content-Type': 'application/json', Accept: 'audio/mpeg' }),
       body: JSON.stringify({ text: req.prompt, model_id: model })
-    });
-    if (!resp.ok) throw new Error(`ElevenLabs error: ${resp.status} ${(await resp.text()).slice(0, 400)}`);
-    const buf = Buffer.from(new Uint8Array(await resp.arrayBuffer()));
+    }, ctx, MAX_MEDIA_BYTES);
+    if (!resp.ok) throw new Error(`ElevenLabs error: ${resp.status} ${responseText(resp).slice(0, 400)}`);
+    const buf = resp.body;
     const mime = resp.headers.get('content-type') || 'audio/mpeg';
     const ext = audioExtFromMime(mime);
     const filename = makeFilename('audio', ext);
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    const bytes = await writeBuffer(abs, buf);
+    const bytes = await writeBuffer(abs, buf, ctx.signal);
     return { absolutePath: abs, relativePath: relative, mimeType: mime, bytes };
   }
 }
@@ -876,7 +952,7 @@ export class MinimaxMediaAdapter implements MediaAdapter {
     const filename = makeFilename(kind, ext);
     const abs = join(ctx.outputDir, ctx.filename || filename);
     const relative = ctx.filename || filename;
-    await writeBuffer(abs, buf);
+    await writeBuffer(abs, buf, ctx.signal);
     return { abs, relative };
   }
 
@@ -890,15 +966,15 @@ export class MinimaxMediaAdapter implements MediaAdapter {
       n: 1,
       prompt_optimizer: true
     };
-    const resp = await fetch(`${this.base()}/image_generation`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body) });
-    if (!resp.ok) throw new Error(`MiniMax image error: ${resp.status} ${(await resp.text()).slice(0, 400)}`);
-    const json = readJsonSafe(await resp.text()) as (MinimaxBaseResp & { data?: { image_urls?: string[] } }) | null;
+    const resp = await apiRequest(`${this.base()}/image_generation`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body) }, ctx);
+    if (!resp.ok) throw new Error(`MiniMax image error: ${resp.status} ${responseText(resp).slice(0, 400)}`);
+    const json = readJsonSafe(responseText(resp)) as (MinimaxBaseResp & { data?: { image_urls?: string[] } }) | null;
     assertMinimaxOk(json);
     const url = json?.data?.image_urls?.[0];
     if (!url) throw new Error('MiniMax returned no image');
-    const dl = await fetch(url);
+    const dl = await returnedDownload(url, ctx);
     if (!dl.ok) throw new Error(`MiniMax image download failed: ${dl.status}`);
-    const buf = Buffer.from(new Uint8Array(await dl.arrayBuffer()));
+    const buf = dl.body;
     const mime = dl.headers.get('content-type') || 'image/png';
     const { abs, relative } = await this.writeOut(buf, 'image', mimeToExt(mime), ctx);
     return { absolutePath: abs, relativePath: relative, mimeType: mime, bytes: buf.length, width, height, seed: req.seed };
@@ -913,13 +989,13 @@ export class MinimaxMediaAdapter implements MediaAdapter {
       voice_setting: { voice_id: voice, speed: 1, vol: 1, pitch: 0 },
       audio_setting: { format: 'mp3', sample_rate: 32000, bitrate: 128000 }
     };
-    const resp = await fetch(`${this.base()}/t2a_v2`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body) });
-    if (!resp.ok) throw new Error(`MiniMax speech error: ${resp.status} ${(await resp.text()).slice(0, 400)}`);
-    const json = readJsonSafe(await resp.text()) as (MinimaxBaseResp & { data?: { audio?: string } }) | null;
+    const resp = await apiRequest(`${this.base()}/t2a_v2`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body) }, ctx, MAX_MEDIA_API_BODY_BYTES);
+    if (!resp.ok) throw new Error(`MiniMax speech error: ${resp.status} ${responseText(resp).slice(0, 400)}`);
+    const json = readJsonSafe(responseText(resp)) as (MinimaxBaseResp & { data?: { audio?: string } }) | null;
     assertMinimaxOk(json);
     const hex = json?.data?.audio;
     if (!hex) throw new Error('MiniMax returned no audio');
-    const buf = Buffer.from(hex, 'hex');
+    const buf = decodeHexArtifact(hex);
     const { abs, relative } = await this.writeOut(buf, 'audio', 'mp3', ctx);
     return { absolutePath: abs, relativePath: relative, mimeType: 'audio/mpeg', bytes: buf.length };
   }
@@ -934,25 +1010,25 @@ export class MinimaxMediaAdapter implements MediaAdapter {
       output_format: 'hex',
       is_instrumental: !lyrics
     };
-    const resp = await fetch(`${this.base()}/music_generation`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body) });
-    if (!resp.ok) throw new Error(`MiniMax music error: ${resp.status} ${(await resp.text()).slice(0, 400)}`);
-    const json = readJsonSafe(await resp.text()) as (MinimaxBaseResp & { data?: { audio?: string } }) | null;
+    const resp = await apiRequest(`${this.base()}/music_generation`, { method: 'POST', headers: this.headers(), body: JSON.stringify(body) }, ctx, MAX_MEDIA_API_BODY_BYTES);
+    if (!resp.ok) throw new Error(`MiniMax music error: ${resp.status} ${responseText(resp).slice(0, 400)}`);
+    const json = readJsonSafe(responseText(resp)) as (MinimaxBaseResp & { data?: { audio?: string } }) | null;
     assertMinimaxOk(json);
     const hex = json?.data?.audio;
     if (!hex) throw new Error('MiniMax returned no music');
-    const buf = Buffer.from(hex, 'hex');
+    const buf = decodeHexArtifact(hex);
     const { abs, relative } = await this.writeOut(buf, 'audio', 'mp3', ctx);
     return { absolutePath: abs, relativePath: relative, mimeType: 'audio/mpeg', bytes: buf.length };
   }
 
   private async video(req: MediaGenerationRequest, ctx: MediaAdapterContext): Promise<MediaJobResult> {
     const duration = req.durationSeconds && req.durationSeconds > 0 ? Math.min(10, Math.max(1, Math.round(req.durationSeconds))) : 6;
-    const start = await fetch(`${this.base()}/video_generation`, {
+    const start = await apiRequest(`${this.base()}/video_generation`, {
       method: 'POST', headers: this.headers(),
       body: JSON.stringify({ model: req.model || 'MiniMax-Hailuo-02', prompt: req.prompt, duration, resolution: '768P' })
-    });
-    if (!start.ok) throw new Error(`MiniMax video start error: ${start.status} ${(await start.text()).slice(0, 400)}`);
-    const sj = readJsonSafe(await start.text()) as (MinimaxBaseResp & { task_id?: string }) | null;
+    }, ctx);
+    if (!start.ok) throw new Error(`MiniMax video start error: ${start.status} ${responseText(start).slice(0, 400)}`);
+    const sj = readJsonSafe(responseText(start)) as (MinimaxBaseResp & { task_id?: string }) | null;
     assertMinimaxOk(sj);
     const taskId = sj?.task_id;
     if (!taskId) throw new Error('MiniMax returned no task_id');
@@ -961,24 +1037,29 @@ export class MinimaxMediaAdapter implements MediaAdapter {
     const deadline = Date.now() + 8 * 60_000;
     let fileId: string | undefined;
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 5000));
-      const q = await fetch(`${this.base()}/query/video_generation?task_id=${encodeURIComponent(taskId)}`, { headers: this.headers() });
+      await abortableMediaDelay(Math.min(5000, deadline - Date.now()), ctx.signal);
+      if (Date.now() >= deadline) break;
+      const q = await apiRequest(
+        `${this.base()}/query/video_generation?task_id=${encodeURIComponent(taskId)}`,
+        { headers: this.headers() },
+        withinDeadline(ctx, deadline)
+      );
       if (!q.ok) continue;
-      const qj = readJsonSafe(await q.text()) as { status?: string; file_id?: string } | null;
+      const qj = readJsonSafe(responseText(q)) as { status?: string; file_id?: string } | null;
       const status = (qj?.status || '').toLowerCase();
       if (status === 'success') { fileId = qj?.file_id; break; }
       if (status === 'fail' || status === 'failed') throw new Error('MiniMax video generation failed');
     }
     if (!fileId) throw new Error('MiniMax video generation timed out');
 
-    const fr = await fetch(`${this.base()}/files/retrieve?file_id=${encodeURIComponent(fileId)}`, { headers: this.headers() });
+    const fr = await apiRequest(`${this.base()}/files/retrieve?file_id=${encodeURIComponent(fileId)}`, { headers: this.headers() }, ctx);
     if (!fr.ok) throw new Error(`MiniMax file retrieve error: ${fr.status}`);
-    const fj = readJsonSafe(await fr.text()) as { file?: { download_url?: string } } | null;
+    const fj = readJsonSafe(responseText(fr)) as { file?: { download_url?: string } } | null;
     const durl = fj?.file?.download_url;
     if (!durl) throw new Error('MiniMax video: no download url');
-    const dl = await fetch(durl);
+    const dl = await returnedDownload(durl, ctx);
     if (!dl.ok) throw new Error(`MiniMax video download failed: ${dl.status}`);
-    const buf = Buffer.from(new Uint8Array(await dl.arrayBuffer()));
+    const buf = dl.body;
     const mime = dl.headers.get('content-type') || 'video/mp4';
     const { abs, relative } = await this.writeOut(buf, 'video', mimeToExt(mime, 'video'), ctx);
     return { absolutePath: abs, relativePath: relative, mimeType: mime, bytes: buf.length, durationSeconds: duration };

@@ -1,8 +1,8 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readlinkSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
 import { logger } from '../utils/logger';
-import { paths } from '../utils/paths';
+import { ensurePrivateDataDir, paths } from '../utils/paths';
 import { resourcesRoot } from '../utils/paths';
 import type { SimulatorChainInfo, SimulatorHealth, SimulatorStatus, SimulatorStartOptions } from '@shared/types';
 
@@ -133,6 +133,35 @@ async function waitForExit(pid: number, timeoutMs = STOP_TIMEOUT_MS): Promise<bo
   return !processAlive(pid);
 }
 
+/** Wait for Node to reap the child and close its stdio before returning. */
+async function terminateChild(proc: ChildProcess): Promise<boolean> {
+  const pid = proc.pid;
+  if (!pid) return true;
+
+  return new Promise<boolean>((resolve) => {
+    let finished = false;
+    let forceTimer: NodeJS.Timeout | undefined;
+    const finish = (closed: boolean): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(termTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      proc.off('close', onClose);
+      resolve(closed);
+    };
+    const onClose = (): void => finish(true);
+    const termTimer = setTimeout(() => {
+      if (processAlive(pid)) {
+        try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+      }
+      forceTimer = setTimeout(() => finish(!processAlive(pid)), 1_000);
+    }, STOP_TIMEOUT_MS);
+
+    proc.once('close', onClose);
+    try { proc.kill('SIGTERM'); } catch { /* already gone */ }
+  });
+}
+
 /**
  * Manages the DERO blockchain simulator (`derod-simulator`) as a child process.
  * The simulator is sourced from cmd/simulator in DEROFDN/derohe and is intended
@@ -216,8 +245,15 @@ export class SimulatorManager {
     // Default to a writable data dir under userData. Note: cmd/simulator's
     // docopt usage has no "--simulator" flag; passing unknown flags makes it
     // print usage and exit immediately.
-    const dataDir = join(paths.userData, 'simulator-data');
-    try { mkdirSync(dataDir, { recursive: true }); } catch { /* best-effort */ }
+    const dataDir = paths.simulatorData;
+    try {
+      ensurePrivateDataDir(dataDir);
+    } catch (error) {
+      this.lastError = `Simulator data directory is unavailable: ${error instanceof Error ? error.message : String(error)}`;
+      this.starting = false;
+      this.emit();
+      return this.status();
+    }
     // Pin the local RPC port so the Studio health check and future structured
     // simulator operations have a stable, loopback-only endpoint.
     this.args = options.args ?? [`--data-dir=${dataDir}`, '--rpc-bind=127.0.0.1:20000'];
@@ -380,17 +416,16 @@ export class SimulatorManager {
     }
 
     const proc = this.proc;
-    try { proc!.kill('SIGTERM'); } catch { /* already gone */ }
-    await waitForExit(proc!.pid!);
+    if (!proc) return this.status();
+    const pid = proc.pid;
+    const stopped = await terminateChild(proc);
 
-    if (this.proc) {
-      try {
-        this.proc.kill('SIGKILL');
-      } catch {
-        // ignore
-      }
+    if (this.proc === proc && (stopped || !pid || !processAlive(pid))) {
       this.proc = null;
       this.startedAt = null;
+    }
+    if (!stopped && pid && processAlive(pid)) {
+      this.lastError = `Simulator PID ${pid} did not stop.`;
     }
 
     this.starting = false;

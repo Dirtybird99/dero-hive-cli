@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { getDb, getSetting } from '../db/client';
 import { BUILTIN_TOOLS, builtinExecutors } from './builtin';
 import { McpManager } from '../mcp/manager';
+import { normalizeMcpToolResult } from '../mcp/client';
 import { getXswdManager } from '../xswd/instance';
 import { reviewXswdTransfer, reviewXswdScInvoke, type XswdTransferParams, type XswdScInvokeParams } from '../xswd/safety';
 import { runPreToolUse, runPostToolUse } from '../hooks/dispatcher';
@@ -59,15 +60,24 @@ export class ToolRegistry extends EventEmitter {
 
   listTools(): ToolDefinition[] {
     const builtin = BUILTIN_TOOLS;
-    const mcp = this.mcpManager?.getAllTools() || [];
+    const builtinNames = new Set(builtin.map((tool) => tool.name));
+    const mcp = (this.mcpManager?.getAllTools() || []).map((tool) => {
+      if (!builtinNames.has(tool.name)) return tool;
+      const serverId = tool.source.slice('mcp:'.length);
+      return { ...tool, name: `mcp:${serverId}:${tool.name}` };
+    });
     return [...builtin, ...mcp];
   }
 
   async execute(name: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+    if (ctx.signal?.aborted) {
+      return { content: `[cancelled] ${name} was cancelled before it started.`, isError: true };
+    }
     // MCP — models call MCP tools by their raw advertised name, so resolve the
     // owning server up front. It is needed before the permission check, because
     // whether the tool needs approval depends on that server's trust flag.
     const mcp = this.executors.has(name) ? null : (this.mcpManager?.resolveTool(name) ?? null);
+    const permissionName = mcp ? `mcp:${mcp.serverId}:${mcp.toolName}` : name;
 
     // preToolUse hooks run before the permission gate. A hook `deny` (or a
     // failing blocking hook) short-circuits the call before the executor runs.
@@ -77,9 +87,9 @@ export class ToolRegistry extends EventEmitter {
     }
 
     // Check permissions
-    const rule = this.matchRule(name, args, ctx);
+    const rule = this.matchRule(permissionName, args, ctx);
     if (rule?.action === 'deny') {
-      return { content: `Denied by permission rule: ${name}`, isError: true };
+      return { content: `Denied by permission rule: ${permissionName}`, isError: true };
     }
     // Irreversible wallet writes are an un-bypassable gate: they always prompt,
     // even under an 'allow' rule or approvalMode 'never', and the decision is
@@ -87,7 +97,7 @@ export class ToolRegistry extends EventEmitter {
     const forcedApproval = WALLET_WRITE_TOOLS.has(name);
     // An explicit `ask` rule always prompts. With no rule, sensitive built-ins
     // prompt, and so does any tool from an MCP server the user has not trusted.
-    const implicitRisk = !rule && (this.requiresApproval(name) || (mcp !== null && !mcp.trusted));
+    const implicitRisk = !rule && (this.requiresApproval(permissionName) || (mcp !== null && !mcp.trusted));
     if (forcedApproval || rule?.action === 'ask' || implicitRisk) {
       let reviewLines: string[] | undefined;
       if (forcedApproval) {
@@ -101,14 +111,18 @@ export class ToolRegistry extends EventEmitter {
       }
       const allowed = await this.authorize({
         requestId: cryptoRandom(),
-        toolName: name,
+        toolName: permissionName,
         args,
         description: forcedApproval
           ? 'Irreversible wallet write; Hive and the connected wallet must both approve.'
           : mcp?.serverName ? `MCP server: ${mcp.serverName}` : undefined,
         reviewLines
       }, ctx, forcedApproval || rule?.action === 'ask');
-      if (!allowed) return { content: `User denied: ${name}`, isError: true };
+      if (!allowed) return { content: `User denied: ${permissionName}`, isError: true };
+    }
+
+    if (ctx.signal?.aborted) {
+      return { content: `[cancelled] ${name} was cancelled before it started.`, isError: true };
     }
 
     // Execute (built-in, then MCP, then unknown), capturing a single result so
@@ -120,17 +134,23 @@ export class ToolRegistry extends EventEmitter {
       catch (err) { result = { content: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true }; }
     } else if (mcp) {
       try {
-        const mcpResult = await this.mcpManager!.callTool(mcp.serverId, mcp.toolName, args);
-        const content = Array.isArray(mcpResult.content)
-          ? (mcpResult.content as Array<{ type: string; text?: string }>).map((c) => c.text || JSON.stringify(c)).join('\n')
-          : String(mcpResult.content);
+        const mcpResult = await this.mcpManager!.callTool(mcp.serverId, mcp.toolName, args, ctx.signal);
+        const normalized = normalizeMcpToolResult(mcpResult.content);
         result = {
-          content,
+          content: normalized.content,
           isError: mcpResult.isError,
-          meta: { source: `mcp:${mcp.serverId}`, serverName: mcp.serverName }
+          meta: { source: `mcp:${mcp.serverId}`, serverName: mcp.serverName, truncated: normalized.truncated }
         };
       } catch (err) {
-        result = { content: `MCP tool error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+        const normalized = normalizeMcpToolResult([
+          { type: 'text', text: 'MCP tool error:' },
+          { type: 'text', text: safeErrorText(err) }
+        ]);
+        result = {
+          content: normalized.content,
+          isError: true,
+          meta: { source: `mcp:${mcp.serverId}`, serverName: mcp.serverName, truncated: normalized.truncated }
+        };
       }
     } else {
       result = { content: `Unknown tool: ${name}`, isError: true };
@@ -255,20 +275,27 @@ export class ToolRegistry extends EventEmitter {
 
     const request = { ...req, conversationId: ctx.conversationId, projectPath: ctx.cwd };
     return new Promise<boolean>((resolve) => {
-      const wrap = (allow: boolean): void => resolve(allow);
+      let settled = false;
+      const onAbort = (): void => finish(false);
+      const finish = (allow: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        ctx.signal?.removeEventListener('abort', onAbort);
+        this.pendingRequests.delete(req.requestId);
+        resolve(allow);
+      };
       this.pendingRequests.set(req.requestId, {
-        resolve: ((d: Decision) => wrap(d === 'allow')) as (d: Decision) => void,
+        resolve: (decision) => finish(decision === 'allow'),
         grantKey,
         explicitAsk
       });
-      this.emit('request', request);
       // Auto-deny after 2 minutes
-      setTimeout(() => {
-        if (this.pendingRequests.has(req.requestId)) {
-          this.pendingRequests.delete(req.requestId);
-          wrap(false);
-        }
-      }, 120_000);
+      const timer = setTimeout(() => finish(false), 120_000);
+      timer.unref?.();
+      ctx.signal?.addEventListener('abort', onAbort, { once: true });
+      if (ctx.signal?.aborted) finish(false);
+      else this.emit('request', request);
     });
   }
 }
@@ -311,4 +338,9 @@ function matchPattern(pattern: string, args: Record<string, unknown>): boolean {
 
 function cryptoRandom(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function safeErrorText(error: unknown): string {
+  try { return error instanceof Error ? error.message : String(error); }
+  catch { return 'unreadable MCP error'; }
 }

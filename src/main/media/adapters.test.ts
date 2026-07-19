@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { MediaKind, MediaProviderConfig } from '../../shared/types.js';
 import { adapterFor } from './adapters.js';
+import { __resolvePublicMediaHostForTest, __setMediaHostResolverForTest, downloadReturnedMedia } from './http.js';
 
 const bytes = Buffer.from('media');
 const b64 = bytes.toString('base64');
@@ -15,6 +16,7 @@ const media = (contentType: string) => new Response(bytes, {
 });
 
 const originalFetch = globalThis.fetch;
+__setMediaHostResolverForTest(async () => ['93.184.216.34']);
 globalThis.fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : input);
   const path = url.pathname;
@@ -74,6 +76,7 @@ try {
   }
 } finally {
   globalThis.fetch = originalFetch;
+  __setMediaHostResolverForTest(null);
   rmSync(outputDir, { recursive: true, force: true });
 }
 
@@ -87,7 +90,7 @@ try {
 import { createServer } from 'node:http';
 import type { MediaAdapterContext } from './adapters.js';
 
-interface StubStep { status?: number; body?: string | Buffer; contentType?: string }
+interface StubStep { status?: number; body?: string | Buffer; contentType?: string; headers?: Record<string, string> }
 const routes = new Map<string, StubStep | StubStep[]>();
 const seen: Array<{ method: string; path: string; search: string; body: string }> = [];
 const stubJson = (value: unknown, status = 200): StubStep => ({ status, body: JSON.stringify(value), contentType: 'application/json' });
@@ -113,6 +116,7 @@ const branchServer = createServer((req, res) => {
     const step = Array.isArray(route) ? (route.length > 1 ? route.shift()! : route[0]) : route;
     res.statusCode = step.status ?? 200;
     if (step.contentType) res.setHeader('content-type', step.contentType);
+    for (const [name, value] of Object.entries(step.headers || {})) res.setHeader(name, value);
     res.end(step.body ?? '');
   });
 });
@@ -240,6 +244,97 @@ try {
   });
   await assert.rejects(openai.adapter.generate({ prompt: 'p' }, openai.ctx), /OpenAI image URL fetch failed: 404/);
 
+  // Provider-returned URLs are an SSRF boundary. Explicitly configured local
+  // provider origins remain usable, but arbitrary private targets and redirects
+  // are rejected before a connection is attempted.
+  setRoutes({
+    '/images/generations': stubJson({ data: [{ url: 'https://169.254.169.254/latest/meta-data' }] })
+  });
+  await assert.rejects(openai.adapter.generate({ prompt: 'p' }, openai.ctx), /non-public address/u);
+
+  setRoutes({
+    '/images/generations': stubJson({ data: [{ url: `${branchBase}/redirect-private` }] }),
+    '/redirect-private': { status: 302, headers: { location: 'https://127.0.0.1/private' } }
+  });
+  await assert.rejects(openai.adapter.generate({ prompt: 'p' }, openai.ctx), /non-public address/u);
+
+  __setMediaHostResolverForTest(async () => ['127.0.0.1']);
+  setRoutes({
+    '/images/generations': stubJson({ data: [{ url: 'https://rebind.invalid/media' }] })
+  });
+  await assert.rejects(openai.adapter.generate({ prompt: 'p' }, openai.ctx), /non-public address/u);
+
+  // The lookup used by the actual connector revalidates every resolution; a
+  // host that changes from public to private is rejected on the later lookup.
+  let dnsCall = 0;
+  __setMediaHostResolverForTest(async () => [dnsCall++ === 0 ? '93.184.216.34' : '127.0.0.1']);
+  assert.deepEqual(await __resolvePublicMediaHostForTest('rebind.invalid'), ['93.184.216.34']);
+  await assert.rejects(__resolvePublicMediaHostForTest('rebind.invalid'), /non-public address/u);
+
+  // A body that stalls after headers is covered by the request deadline, and
+  // an oversized Content-Length is rejected without buffering the response.
+  __setMediaHostResolverForTest(async () => ['93.184.216.34']);
+  const nativeFetch = globalThis.fetch;
+  let stalledBodyCancelled = false;
+  let oversizedStreamCancelled = false;
+  let crossOriginAuthorizationSeen = false;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.hostname === 'media.invalid' && url.pathname === '/stall') {
+      return new Response(new ReadableStream<Uint8Array>({
+        cancel() { stalledBodyCancelled = true; }
+      }), { headers: { 'content-type': 'image/png' } });
+    }
+    if (url.hostname === 'media.invalid' && url.pathname === '/large') {
+      return new Response(bytes, {
+        headers: { 'content-type': 'image/png', 'content-length': String(50 * 1024 * 1024 + 1) }
+      });
+    }
+    if (url.hostname === 'media.invalid' && url.pathname === '/stream') {
+      return new Response(new ReadableStream<Uint8Array>({
+        pull(controller) { controller.enqueue(new Uint8Array(600_000)); },
+        cancel() { oversizedStreamCancelled = true; }
+      }), { headers: { 'content-type': 'image/png' } });
+    }
+    if (url.hostname === 'media.invalid' && url.pathname === '/control') {
+      crossOriginAuthorizationSeen = new Headers(init?.headers).has('authorization');
+      return new Response('{}', { headers: { 'content-type': 'application/json' } });
+    }
+    return nativeFetch(input, init);
+  };
+  try {
+    const filesBeforeGuardFailures = readdirSync(branchDir).length;
+    setRoutes({
+      '/images/generations': stubJson({ data: [{ url: 'https://media.invalid/stall' }] })
+    });
+    const timeoutStart = Date.now();
+    await assert.rejects(
+      openai.adapter.generate({ prompt: 'p' }, { ...openai.ctx, requestTimeoutMs: 40 }),
+      /timed out after \d+ms/u
+    );
+    assert.ok(Date.now() - timeoutStart < 1_000, 'stalled media body must settle at its request deadline');
+    assert.equal(stalledBodyCancelled, true, 'timed-out media body must be cancelled');
+
+    setRoutes({
+      '/images/generations': stubJson({ data: [{ url: 'https://media.invalid/large' }] })
+    });
+    await assert.rejects(openai.adapter.generate({ prompt: 'p' }, openai.ctx), /exceeds 50 MB limit/u);
+    await assert.rejects(
+      downloadReturnedMedia('https://media.invalid/stream', branchBase, { maxBytes: 1024 * 1024 }),
+      /exceeds 1 MB limit/u
+    );
+    assert.equal(oversizedStreamCancelled, true, 'chunked oversized media must cancel without reading the full stream');
+    await downloadReturnedMedia('https://media.invalid/control', branchBase, {
+      maxBytes: 1024,
+      init: { headers: { Authorization: 'Bearer must-not-leak' } }
+    });
+    assert.equal(crossOriginAuthorizationSeen, false, 'provider credentials must not follow a returned cross-origin URL');
+    assert.equal(readdirSync(branchDir).length, filesBeforeGuardFailures, 'guard failures must not leave artifact or partial files');
+  } finally {
+    globalThis.fetch = nativeFetch;
+    __setMediaHostResolverForTest(null);
+  }
+
   // ── Stability / Pollinations error bodies ─────────────────────────────────
   await assert.rejects(mk('stability', 'image', '').adapter.generate({ prompt: 'p' }, stability.ctx), /Stability API key not set/);
   setRoutes({ '/v2beta/stable-image/generate/core': { status: 402, body: 'payment required' } });
@@ -328,6 +423,22 @@ try {
     '/predictions/p3': { status: 500 }
   });
   await assert.rejects(replicate.adapter.generate({ prompt: 'p', model: 'owner/model' }, replicate.ctx), /Replicate poll error: 500/);
+
+  // Cancellation interrupts the polling sleep itself; it does not wait for the
+  // next network request or leave a timer/handle behind.
+  setRoutes({
+    '/models/owner/model/predictions': stubJson({ id: 'p-cancel', status: 'processing', urls: { get: `${branchBase}/predictions/p-cancel` } }),
+    '/predictions/p-cancel': stubJson({ id: 'p-cancel', status: 'processing' })
+  });
+  const pollAbort = new AbortController();
+  setTimeout(() => pollAbort.abort(), 25);
+  const pollAbortStart = Date.now();
+  await assert.rejects(
+    replicate.adapter.generate({ prompt: 'p', model: 'owner/model' }, { ...replicate.ctx, signal: pollAbort.signal }),
+    (error: unknown) => error instanceof Error && error.name === 'AbortError'
+  );
+  assert.ok(Date.now() - pollAbortStart < 1_000, 'poll cancellation must settle without waiting 1.5 seconds');
+  assert.equal(seen.filter((request) => request.path === '/predictions/p-cancel').length, 0);
 
   // Malformed JSON mid-poll rejects (current behavior: null prediction TypeError).
   setRoutes({
@@ -533,6 +644,7 @@ try {
   assert.equal(mmVidStart.duration, 10);
   assert.match(seen.find((r) => r.path === '/query/video_generation')!.search, /task_id=t1/);
 } finally {
+  __setMediaHostResolverForTest(null);
   branchServer.close();
   rmSync(branchDir, { recursive: true, force: true });
 }
