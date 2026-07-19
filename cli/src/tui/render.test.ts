@@ -142,6 +142,13 @@ try {
   assert.match(output, /ctrl\+x/);
   assert.doesNotMatch(output, /✦/, 'reduced motion must keep the logo static');
   const ansiCsi = new RegExp(`${escape}\\[[0-?]*[ -/]*[@-~]`, 'g');
+  const strippedOutput = (): string => output.replace(ansiCsi, '');
+  async function waitForOutput(pattern: RegExp): Promise<void> {
+    for (let attempt = 0; attempt < 150 && !pattern.test(strippedOutput()); attempt += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    assert.match(strippedOutput(), pattern);
+  }
   assert.ok(output.includes(`${escape}]10;#e1e1e1`));
   assert.ok(output.includes(`${escape}]11;#141414`));
   assert.match(output, /No provider is configured|no provider/i);
@@ -448,8 +455,7 @@ setInterval(() => {}, 1000);
   await new Promise((resolveWait) => setTimeout(resolveWait, 60));
   output = '';
   stdin.write('\r');
-  await new Promise((resolveWait) => setTimeout(resolveWait, 250));
-  assert.match(output.replace(ansiCsi, ''), /new conversation/i);
+  await waitForOutput(/new\s+conversation/i);
   const cliConfig = await import('../utils/config.js');
   const { sameWorkspacePath } = await import('../../../src/shared/workspace.js');
   const switchedState = cliConfig.loadState();
@@ -574,16 +580,9 @@ setInterval(() => {}, 1000);
   });
   assert.equal(savedFake.discovery.ok, true, 'the loopback provider must connect without external network');
 
-  const strippedOutput = (): string => output.replace(ansiCsi, '');
   const whitespaceTolerant = (text: string): RegExp => new RegExp(
     text.split(' ').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+')
   );
-  async function waitForOutput(pattern: RegExp): Promise<void> {
-    for (let attempt = 0; attempt < 150 && !pattern.test(strippedOutput()); attempt += 1) {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
-    }
-    assert.match(strippedOutput(), pattern);
-  }
   async function pressKey(sequence: string, settleMs = 80): Promise<void> {
     stdin.write(sequence);
     await new Promise((resolveWait) => setTimeout(resolveWait, settleMs));

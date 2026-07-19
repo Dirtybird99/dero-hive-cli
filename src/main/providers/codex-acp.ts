@@ -483,7 +483,6 @@ async function waitForProcessGroupExit(pid: number): Promise<boolean> {
         clearTimeout(timer);
         resolveWait();
       }, Math.min(25, remaining));
-      timer.unref();
     });
   }
   return true;
