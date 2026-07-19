@@ -166,6 +166,37 @@ try {
   assert.deepEqual(getSetting('persist-check'), { n: 1 });
   closeDb();
 
+  // WAL negotiation can report SQLITE_BUSY without honoring busy_timeout.
+  // Prove init retries that exact transient error instead of masking others.
+  const retryDir = join(rootDir, 'wal-retry');
+  process.env.HIVE_DATA_DIR = retryDir;
+  const databasePrototype = Database.prototype as unknown as { pragma: (...args: unknown[]) => unknown };
+  const originalPragma = databasePrototype.pragma;
+  let walAttempts = 0;
+  let injectedCode: string | undefined = 'SQLITE_BUSY';
+  databasePrototype.pragma = function pragmaWithOneBusy(this: unknown, ...args: unknown[]): unknown {
+    if (args[0] === 'journal_mode = WAL') {
+      walAttempts += 1;
+      if (injectedCode) {
+        const code = injectedCode;
+        injectedCode = undefined;
+        throw Object.assign(new Error('injected SQLite failure'), { code });
+      }
+    }
+    return originalPragma.apply(this, args);
+  };
+  try {
+    await initDb();
+    assert.equal(walAttempts, 2);
+    closeDb();
+    process.env.HIVE_DATA_DIR = join(rootDir, 'wal-non-busy');
+    injectedCode = 'SQLITE_IOERR';
+    await assert.rejects(initDb(), (error: unknown) => (error as { code?: string }).code === 'SQLITE_IOERR');
+  } finally {
+    databasePrototype.pragma = originalPragma;
+    closeDb();
+  }
+
   // Fresh startup is safe when several CLI processes negotiate WAL and run
   // the idempotent migration chain at the same time.
   const concurrentInitDir = join(rootDir, 'concurrent-init');

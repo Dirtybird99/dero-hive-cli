@@ -297,7 +297,17 @@ export async function initDb(): Promise<void> {
     // Acquire writer locks patiently across CLI processes. Set this before WAL
     // mode because journal negotiation itself can briefly contend at startup.
     db.pragma(`busy_timeout = ${DB_BUSY_TIMEOUT_MS}`);
-    const journalMode = db.pragma('journal_mode = WAL', { simple: true });
+    const journalModeDeadline = Date.now() + DB_BUSY_TIMEOUT_MS;
+    let journalMode: unknown;
+    while (true) {
+      try {
+        journalMode = db.pragma('journal_mode = WAL', { simple: true });
+        break;
+      } catch (error) {
+        if ((error as { code?: string }).code !== 'SQLITE_BUSY' || Date.now() >= journalModeDeadline) throw error;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+    }
     if (journalMode !== 'wal') throw new Error(`SQLite WAL mode unavailable (got ${String(journalMode)})`);
     db.pragma('foreign_keys = ON');
     db.pragma('synchronous = FULL');

@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { prepareNpmGlobalPrefix } from './npm-global-prefix.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const temp = await mkdtemp(join(tmpdir(), 'dero-hive-package-'));
@@ -49,7 +50,7 @@ function run(command, args, options = {}) {
 }
 
 try {
-  await Promise.all([mkdir(packDir), mkdir(prefix)]);
+  await Promise.all([mkdir(packDir), prepareNpmGlobalPrefix(prefix)]);
   const npmVersion = run(npm, ['--version'], { capture: true }).trim();
   if (Number.parseInt(npmVersion, 10) < 12) throw new Error(`npm 12+ required; found ${npmVersion}`);
 

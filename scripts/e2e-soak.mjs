@@ -16,6 +16,7 @@ import { createServer } from 'node:http';
 import { cpus, freemem, loadavg, platform, release, tmpdir, totalmem } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { prepareNpmGlobalPrefix } from './npm-global-prefix.mjs';
 
 const MODEL_ID = 'fixture-model';
 const PROVIDER_ID = 'soak-local';
@@ -1419,7 +1420,7 @@ async function main() {
   const otherWorkspace = join(runtimeRoot, 'rejected workspace with spaces Ω');
   const npmCache = join(runtimeRoot, 'npm cache Ω');
   const npmUserConfig = join(runtimeRoot, 'isolated-npmrc');
-  await Promise.all([mkdir(installPrefix), mkdir(dataDir), mkdir(workspace), mkdir(otherWorkspace), mkdir(npmCache)]);
+  await Promise.all([prepareNpmGlobalPrefix(installPrefix), mkdir(dataDir), mkdir(workspace), mkdir(otherWorkspace), mkdir(npmCache)]);
   await writeFile(npmUserConfig, 'audit=false\nfund=false\nupdate-notifier=false\n', 'utf8');
 
   const canary = `hive_soak_canary_${randomBytes(24).toString('hex')}`;
